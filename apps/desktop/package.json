@@ -1,0 +1,19 @@
+{
+  "name": "@project-archivist/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@project-archivist/exporter": "workspace:*",
+    "@project-archivist/schema": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^6.1.0"
+  }
+}

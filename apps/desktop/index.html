@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Project Archivist Desktop</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <aside id="sidebar">
+      <h1>Project Archivist</h1>
+      <button data-view="archive">Archive</button>
+      <button data-view="import">Import</button>
+      <button data-view="export">Export Jobs</button>
+      <button data-view="settings">Settings</button>
+      <button data-view="diagnostics">Diagnostics</button>
+    </aside>
+    <main>
+      <section id="content"></section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

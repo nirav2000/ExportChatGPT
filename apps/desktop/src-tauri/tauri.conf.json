@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Project Archivist",
+  "version": "0.1.0",
+  "identifier": "local.project.archivist",
+  "build": {
+    "beforeDevCommand": "pnpm --dir .. dev",
+    "beforeBuildCommand": "pnpm --dir .. build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {"windows": [{"title": "Project Archivist", "width": 1200, "height": 800}]}
+}
