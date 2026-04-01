@@ -1,10 +1,12 @@
 # Chrome Extension
 
-## Features (current scaffold)
+## Features
 - MV3 background service worker
-- Side panel UI with scan action
-- Popup fallback
-- Content script basic message extraction
+- Side panel UI with status chips + permission state
+- Current chat capture (messages, assets, warnings)
+- Dedicated export-tab workspace scan
+- Asset byte resolution with SHA-256 hashing when fetchable
+- Local capture bundle JSON download
 
 ## Load unpacked
 1. Run `pnpm --filter @project-archivist/extension build`

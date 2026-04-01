@@ -9,35 +9,36 @@ Project Archivist is a **local-first** ChatGPT workspace archiver with a Tauri d
 - shared schema/core/exporter/extractor packages
 - baseline docs and policies
 
-### Phase 2 (desktop import/export pipeline foundation)
-- Tauri commands for:
-  - diagnostics (`diagnostics_health`)
-  - import capture bundle JSON (`import_capture_bundle`)
-  - list project/chat overview (`list_projects_chats`)
-  - queue export jobs (`queue_export_job`)
-- SQLite schema bootstrap (`workspaces`, `projects`, `chats`, `messages`, `export_jobs`)
-- Desktop UI wired to invoke import/export/list commands when running in Tauri
+### Phase 2 (desktop import/export pipeline)
+- Tauri commands:
+  - `diagnostics_health`
+  - `diagnostics_report`
+  - `import_capture_bundle`
+  - `import_official_export_zip`
+  - `list_projects_chats`
+  - `queue_export_job`
+  - `run_pending_export_jobs`
+- SQLite schema bootstrap and persisted incremental export fingerprints
+- Resume failed/queued export jobs and diagnostics counters in UI
 
-### Phase 3 (extension current-chat export)
+### Phase 3/4 (extension capture + workspace scan)
 - MV3 side panel + popup fallback
-- runtime optional permission request for ChatGPT host access
-- current-tab chat extraction (messages + images metadata)
-- local capture bundle generation in service worker
-- one-click JSON bundle download via `chrome.downloads`
+- Runtime optional permission request flow
+- Current chat extraction with message blocks and media metadata
+- Dedicated export-tab workspace scanner (`scan-workspace-nav`)
+- Asset byte resolution + SHA-256 hashing (where fetchable)
+- Capture bundle download
 
-## Remaining (next iterations)
-- Official ChatGPT export ZIP parser and importer
-- Dedicated export-tab navigation walker for project/workspace scans
-- Asset byte download + content hashing in extension
-- Incremental export skip/force/repair logic persisted end-to-end
-- Resume interrupted exports and richer diagnostics UI
-- Playwright coverage for desktop and extension fixture flows
+### Phase 5 (testing + polish)
+- Vitest unit tests for shared packages
+- Playwright coverage scaffolding for desktop shell and extension manifest flow
 
 ## Quick start
 ```bash
 pnpm install
 pnpm build
 pnpm test
+pnpm test:e2e
 pnpm dev:desktop
 pnpm --filter @project-archivist/extension build
 ```

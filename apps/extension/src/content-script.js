@@ -27,9 +27,7 @@ function extractAssets(messageId, root) {
   return assets;
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message.type !== 'extract-chat') return;
-
+function extractChatPayload() {
   const projectName = document.querySelector('nav [aria-current="page"]')?.textContent?.trim() || null;
   const title = document.title;
   const warnings = [];
@@ -55,5 +53,35 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     assets.push(...extractAssets(messageId, node));
   });
 
-  sendResponse({ title, projectName, messages, assets, attachments: [], warnings, fingerprint: `${messages.length}:${assets.length}` });
+  return { title, projectName, messages, assets, attachments: [], warnings, fingerprint: `${messages.length}:${assets.length}` };
+}
+
+function scanWorkspaceNav() {
+  const projects = [];
+  const chats = [];
+
+  const navLinks = Array.from(document.querySelectorAll('nav a'));
+  navLinks.forEach((a) => {
+    const href = a.getAttribute('href') || '';
+    const label = a.textContent?.trim() || '';
+    if (!label) return;
+
+    if (href.includes('/g/') || a.closest('[data-project]')) {
+      projects.push({ name: label, href });
+    } else if (href.includes('/c/')) {
+      chats.push({ title: label, href });
+    }
+  });
+
+  return {
+    detectedAt: new Date().toISOString(),
+    projects,
+    chats,
+    warnings: navLinks.length ? [] : ['No nav links found for scanning'],
+  };
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === 'extract-chat') return sendResponse(extractChatPayload());
+  if (message.type === 'scan-workspace-nav') return sendResponse(scanWorkspaceNav());
 });

@@ -19,6 +19,14 @@ function setState(state) {
   captureStateEl.className = `chip ${state}`;
 }
 
+async function refreshLastState() {
+  const snapshot = await chrome.runtime.sendMessage({ type: 'get-last-capture' });
+  if (snapshot?.captureState) setState(snapshot.captureState);
+  if (snapshot?.lastCapture) {
+    resultEl.textContent = JSON.stringify(snapshot.lastCapture, null, 2);
+  }
+}
+
 async function doCapture() {
   setState('capturing');
   const response = await chrome.runtime.sendMessage({ type: 'capture-current-chat' });
@@ -29,6 +37,18 @@ async function doCapture() {
   }
   setState('complete');
   resultEl.textContent = JSON.stringify(response.bundle, null, 2);
+}
+
+async function doWorkspaceScan() {
+  setState('scanning');
+  const response = await chrome.runtime.sendMessage({ type: 'scan-workspace' });
+  if (!response?.ok) {
+    setState('failed');
+    resultEl.textContent = `Scan failed: ${response?.error || 'Unknown error'}`;
+    return;
+  }
+  setState('partial');
+  resultEl.textContent = JSON.stringify(response.scan, null, 2);
 }
 
 async function doExport() {
@@ -46,9 +66,10 @@ document.getElementById('requestPerm')?.addEventListener('click', async () => {
 document.getElementById('scan')?.addEventListener('click', doCapture);
 document.getElementById('exportChat')?.addEventListener('click', doExport);
 document.getElementById('exportProject')?.addEventListener('click', doExport);
-document.getElementById('exportAll')?.addEventListener('click', doExport);
-document.getElementById('rescan')?.addEventListener('click', doCapture);
+document.getElementById('exportAll')?.addEventListener('click', doWorkspaceScan);
+document.getElementById('rescan')?.addEventListener('click', doWorkspaceScan);
 
 updatePermissionState();
 updateEligibility();
+refreshLastState();
 setState('ready');
