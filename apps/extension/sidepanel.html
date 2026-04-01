@@ -1,1 +1,38 @@
-<!doctype html><html><body><h2>Project Archivist</h2><p id="status">ready</p><button id="scan">Scan current chat</button><script type="module" src="src/sidepanel.js"></script></body></html>
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font-family: system-ui; margin: 12px; background: #11151d; color: #e8edf6; }
+      .row { margin-bottom: 10px; }
+      .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+      .chip { border: 1px solid #324158; border-radius: 999px; padding: 2px 8px; font-size: 12px; }
+      .ready { border-color: #4caf50; }
+      .scanning,.capturing,.downloading { border-color: #f5b042; }
+      .complete { border-color: #64b5f6; }
+      .partial { border-color: #ab47bc; }
+      .failed { border-color: #ff5252; }
+      button { width: 100%; margin: 4px 0; padding: 8px; border-radius: 8px; border: 1px solid #324158; background:#1a2230; color: #e8edf6; }
+      pre { background:#0a0f16; border:1px solid #2a3547; padding:8px; border-radius:8px; white-space:pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h2>Project Archivist</h2>
+    <div class="row chips">
+      <span class="chip ready" id="eligibility">ready</span>
+      <span class="chip" id="permission">permission: unknown</span>
+      <span class="chip" id="captureState">idle</span>
+    </div>
+
+    <button id="requestPerm">Request ChatGPT permission</button>
+    <button id="scan">Scan current chat</button>
+    <button id="exportChat">Export current chat</button>
+    <button id="exportProject">Export current project</button>
+    <button id="exportAll">Export all detected</button>
+    <button id="rescan">Re-scan workspace</button>
+
+    <pre id="result">No capture yet.</pre>
+
+    <script type="module" src="src/sidepanel.js"></script>
+  </body>
+</html>

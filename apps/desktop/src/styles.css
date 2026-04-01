@@ -6,3 +6,6 @@ button:hover { border-color:var(--accent); }
 main { padding:18px; }
 .card { background:var(--panel); border:1px solid #2e3544; border-radius:10px; padding:14px; margin-bottom:12px; }
 .muted { color:var(--muted); }
+textarea,input { background:#0f131a; color:var(--text); border:1px solid #2e3544; border-radius:8px; padding:8px; }
+table { width:100%; border-collapse:collapse; }
+th,td { border-bottom:1px solid #2e3544; text-align:left; padding:6px; }
