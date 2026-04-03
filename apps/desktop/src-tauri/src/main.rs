@@ -652,8 +652,10 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #111827; color: #e5e7eb; }}
     .wrap {{ display: grid; grid-template-columns: 320px 1fr; min-height: 100vh; }}
-    .sidebar {{ border-right: 1px solid #374151; padding: 16px; background: #0f172a; }}
-    .main {{ padding: 16px; }}
+    .sidebar {{ border-right: 1px solid #374151; padding: 16px; background: #0f172a; overflow:auto; transition: width .2s ease, padding .2s ease, opacity .2s ease; }}
+    .sidebar.collapsed {{ width: 0; padding: 0; opacity: 0; overflow: hidden; border-right: none; }}
+    .main {{ padding: 0; display:flex; flex-direction:column; min-width:0; }}
+    .topbar {{ display:flex; gap:8px; align-items:center; padding:12px; border-bottom:1px solid #374151; background:#0b1220; }}
     input {{ width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: #e5e7eb; }}
     details {{ margin: 10px 0; border: 1px solid #334155; border-radius: 8px; padding: 8px; background: #111827; }}
     summary {{ cursor: pointer; font-weight: 600; }}
@@ -662,11 +664,13 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
     a:hover {{ text-decoration: underline; }}
     .muted {{ color: #94a3b8; }}
     .chat-item.hidden, .project-group.hidden {{ display: none; }}
+    iframe {{ width:100%; height:calc(100vh - 54px); border:0; background:white; }}
+    button {{ padding:8px 12px; border-radius:8px; border:1px solid #475569; background:#111827; color:#e5e7eb; cursor:pointer; }}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="sidebar">
+    <div class="sidebar" id="sidebar">
       <h2>Exports</h2>
       <input id="search" placeholder="Search projects or chats" />
       <div id="tree">
@@ -678,12 +682,19 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
       </div>
     </div>
     <div class="main">
-      <h1>Project Archivist Export Index</h1>
-      <p class="muted">Open chats from the sidebar. Use search to filter projects and chats.</p>
+      <div class="topbar">
+        <button id="toggleSidebar">Hide sidebar</button>
+        <span class="muted">Open chats in the viewer below.</span>
+      </div>
+      <iframe id="viewer" src="about:blank"></iframe>
     </div>
   </div>
   <script>
     const search = document.getElementById('search');
+    const sidebar = document.getElementById('sidebar');
+    const viewer = document.getElementById('viewer');
+    const toggleBtn = document.getElementById('toggleSidebar');
+
     search.addEventListener('input', () => {{
       const q = search.value.toLowerCase();
       document.querySelectorAll('.project-group').forEach(group => {{
@@ -693,6 +704,20 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
       document.querySelectorAll('.chat-item').forEach(item => {{
         const text = item.textContent.toLowerCase();
         item.classList.toggle('hidden', q && !text.includes(q));
+      }});
+    }});
+
+    toggleBtn.addEventListener('click', () => {{
+      sidebar.classList.toggle('collapsed');
+      toggleBtn.textContent = sidebar.classList.contains('collapsed') ? 'Show sidebar' : 'Hide sidebar';
+    }});
+
+    document.querySelectorAll('#tree a').forEach(a => {{
+      a.addEventListener('click', (e) => {{
+        e.preventDefault();
+        viewer.src = a.getAttribute('href');
+        sidebar.classList.add('collapsed');
+        toggleBtn.textContent = 'Show sidebar';
       }});
     }});
   </script>
