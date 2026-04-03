@@ -43,5 +43,10 @@ pnpm dev:desktop
 pnpm --filter @project-archivist/extension build
 ```
 
+
+## Install guides
+- Desktop (macOS): `docs/install/desktop-macos.md`
+- Chrome extension: `docs/install/chrome-extension.md`
+
 ## Privacy
 No backend. No telemetry. Data remains local unless the user exports files.
