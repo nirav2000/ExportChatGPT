@@ -239,8 +239,7 @@
     </div>
 
     <button id="requestPerm">Request ChatGPT permission</button>
-    <button id="scan">Scan current chat</button>
-    <button id="exportChat">Export current chat</button>
+    <button id="scanStandalone">Scan standalone chats</button>
     <button id="scanProject">Scan current project</button>
     <button id="exportSelectedGroups">Export selected groups</button>
     <button id="exportSelectedChats">Export selected chats</button>
@@ -258,7 +257,7 @@
 
     <div class="card">
       <h3>Scanned Structure</h3>
-      <div id="structureSummary" class="muted">No project scan yet.</div>
+      <div id="structureSummary" class="muted">No scan yet.</div>
       <div class="small-actions">
         <button id="checkAllVisible">Check all</button>
         <button id="uncheckAllVisible">Uncheck all</button>
@@ -306,7 +305,7 @@
 
     <div class="card">
       <h3>Raw Result</h3>
-      <pre id="result">No capture yet.</pre>
+      <pre id="result">No scan yet.</pre>
     </div>
 
     <script type="module" src="src/sidepanel.js"></script>

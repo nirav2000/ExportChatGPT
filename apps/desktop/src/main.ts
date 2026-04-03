@@ -1,9 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 
 const content = document.querySelector<HTMLDivElement>('#content');
 
 const AUTO_IMPORT_FOLDER_KEY = 'project-archivist.autoImportFolder';
 const AUTO_IMPORT_ENABLED_KEY = 'project-archivist.autoImportEnabled';
+const EXPORT_ROOT_KEY = 'project-archivist.exportRoot';
+const DEFAULT_EXPORT_ROOT = '/Users/n/Downloads/project-archivist-export/';
 
 let autoImportTimer: number | null = null;
 let autoImportInFlight = false;
@@ -41,7 +44,7 @@ function section(title: string, inner: string): string {
 }
 
 function getWatchedFolder(): string {
-  return localStorage.getItem(AUTO_IMPORT_FOLDER_KEY) || '/Users/n/Desktop/project-archivist';
+  return localStorage.getItem(AUTO_IMPORT_FOLDER_KEY) || '';
 }
 
 function isAutoImportEnabled(): boolean {
@@ -54,6 +57,14 @@ function setWatchedFolder(folder: string): void {
 
 function setAutoImportEnabled(enabled: boolean): void {
   localStorage.setItem(AUTO_IMPORT_ENABLED_KEY, enabled ? 'true' : 'false');
+}
+
+function getExportRoot(): string {
+  return localStorage.getItem(EXPORT_ROOT_KEY) || DEFAULT_EXPORT_ROOT;
+}
+
+function setExportRoot(root: string): void {
+  localStorage.setItem(EXPORT_ROOT_KEY, root);
 }
 
 function setStatusText(id: string, text: string): void {
@@ -162,7 +173,8 @@ async function renderArchive(): Promise<void> {
     `
     <style>
       .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-      .toolbar input{flex:1;min-width:240px;padding:8px}
+      .toolbar input,.toolbar select{padding:8px}
+      .toolbar .grow-input{flex:1;min-width:240px}
       .project-block{border:1px solid #334155;border-radius:10px;padding:8px;margin:10px 0;background:#0f172a}
       .project-block.changed{border-color:#f59e0b;box-shadow: inset 0 0 0 1px rgba(245,158,11,.25)}
       .project-head{display:flex;align-items:center;gap:8px}
@@ -177,9 +189,17 @@ async function renderArchive(): Promise<void> {
       .actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
     </style>
     <div class="toolbar">
-      <input id="archiveSearchInput" placeholder="Search projects or chats" value="${escapeHtml(archiveSearch)}" />
+      <input id="archiveSearchInput" class="grow-input" placeholder="Search projects or chats" value="${escapeHtml(archiveSearch)}" />
+      <input id="archiveExportRootInput" class="grow-input" placeholder="Export root folder" value="${escapeHtml(getExportRoot())}" />
+      <select id="archiveExportMode">
+        <option value="incremental">incremental</option>
+        <option value="force" selected>force</option>
+      </select>
     </div>
     <div class="actions">
+      <button id="selectAllBtn">Select all visible</button>
+      <button id="clearSelectionBtn">Unselect all</button>
+      <button id="runArchiveAutoImportBtn">Auto import now</button>
       <button id="exportSelectedBtn">Export selected</button>
       <button id="deleteSelectedBtn">Remove selected from archive</button>
       <button id="expandAllBtn">Expand all</button>
@@ -197,13 +217,19 @@ async function renderArchive(): Promise<void> {
         </div>
       </div>
     </div>
-    <div class="muted">Exports generate <code>Project Archivist Export/index.html</code> with sidebar search.</div>
+    <pre id="archiveActionResult" class="muted"></pre>
+    <div class="muted">Exports generate <code>Project Archivist Export/index.html</code> and a launcher at <code>index.html</code> in the chosen root folder.</div>
     `,
   );
 
   document.getElementById('archiveSearchInput')?.addEventListener('input', async (e) => {
     archiveSearch = (e.target as HTMLInputElement).value;
     await renderArchive();
+  });
+
+  document.getElementById('archiveExportRootInput')?.addEventListener('change', (e) => {
+    const root = (e.target as HTMLInputElement).value.trim();
+    if (root) setExportRoot(root);
   });
 
   for (const btn of document.querySelectorAll<HTMLButtonElement>('.collapse-btn')) {
@@ -240,6 +266,45 @@ async function renderArchive(): Promise<void> {
     });
   }
 
+  document.getElementById('selectAllBtn')?.addEventListener('click', async () => {
+    for (const project of projects) {
+      selectedProjectIds.add(project.id);
+      for (const chat of project.chats) selectedChatIds.add(chat.id);
+    }
+    for (const chat of standalone) {
+      selectedChatIds.add(chat.id);
+    }
+    await renderArchive();
+  });
+
+  document.getElementById('clearSelectionBtn')?.addEventListener('click', async () => {
+    selectedProjectIds.clear();
+    selectedChatIds.clear();
+    await renderArchive();
+  });
+
+  document.getElementById('runArchiveAutoImportBtn')?.addEventListener('click', async () => {
+    const archiveResult = document.getElementById('archiveActionResult');
+    const watchedFolder = getWatchedFolder().trim();
+
+    if (!watchedFolder) {
+      if (archiveResult) archiveResult.textContent = 'Set a watched folder in Settings first.';
+      return;
+    }
+
+    try {
+      if (archiveResult) archiveResult.textContent = `Importing JSON files from ${watchedFolder} ...`;
+      const result = await invoke<string>('auto_import_capture_folder', {
+        folderPath: watchedFolder,
+      });
+      await renderArchive();
+      const refreshedResult = document.getElementById('archiveActionResult');
+      if (refreshedResult) refreshedResult.textContent = result;
+    } catch (error) {
+      if (archiveResult) archiveResult.textContent = `Auto-import failed: ${(error as Error).message}`;
+    }
+  });
+
   document.getElementById('expandAllBtn')?.addEventListener('click', async () => {
     collapsedProjects.clear();
     await renderArchive();
@@ -251,39 +316,77 @@ async function renderArchive(): Promise<void> {
   });
 
   document.getElementById('deleteSelectedBtn')?.addEventListener('click', async () => {
-    if (!selectedProjectIds.size && !selectedChatIds.size) return;
-    const ok = confirm('Remove the selected projects/chats from the archive? This clears them from the local app database.');
-    if (!ok) return;
+    const archiveResult = document.getElementById('archiveActionResult');
 
-    const result = await invoke<string>('delete_archive_items', {
-      projectIds: Array.from(selectedProjectIds),
-      chatIds: Array.from(selectedChatIds),
-    });
-
-    selectedProjectIds.clear();
-    selectedChatIds.clear();
-    await renderArchive();
-    alert(result);
-  });
-
-  document.getElementById('exportSelectedBtn')?.addEventListener('click', async () => {
     if (!selectedProjectIds.size && !selectedChatIds.size) {
-      alert('Select at least one project or chat first.');
+      if (archiveResult) archiveResult.textContent = 'Select at least one project or chat first.';
       return;
     }
 
-    const root = prompt('Export root folder:', '/Users/n/Desktop/project-archivist') || '/Users/n/Desktop/project-archivist';
-    const mode = prompt('Export mode (incremental / force / repair_assets):', 'force') || 'force';
+    const root = ((document.getElementById('archiveExportRootInput') as HTMLInputElement | null)?.value || getExportRoot()).trim();
+    if (root) setExportRoot(root);
 
-    const result = await invoke<string>('export_selected_archive', {
-      rootDir: root,
-      mode,
-      projectIds: Array.from(selectedProjectIds),
-      chatIds: Array.from(selectedChatIds),
-    });
+    const ok = window.confirm(
+      'Remove the selected projects/chats from the archive and delete their exported files from disk?'
+    );
+    if (!ok) return;
 
-    await renderArchive();
-    alert(result);
+    try {
+      if (archiveResult) archiveResult.textContent = 'Removing selected items...';
+
+      const result = await invoke<string>('delete_archive_items', {
+        projectIds: Array.from(selectedProjectIds),
+        chatIds: Array.from(selectedChatIds),
+        rootDir: root,
+      });
+
+      selectedProjectIds.clear();
+      selectedChatIds.clear();
+      await renderArchive();
+
+      const refreshedResult = document.getElementById('archiveActionResult');
+      if (refreshedResult) refreshedResult.textContent = result;
+    } catch (error) {
+      if (archiveResult) archiveResult.textContent = `Delete failed: ${(error as Error).message}`;
+      console.error(error);
+    }
+  });
+
+  document.getElementById('exportSelectedBtn')?.addEventListener('click', async () => {
+    const archiveResult = document.getElementById('archiveActionResult');
+
+    if (!selectedProjectIds.size && !selectedChatIds.size) {
+      if (archiveResult) archiveResult.textContent = 'Select at least one project or chat first.';
+      return;
+    }
+
+    const root = ((document.getElementById('archiveExportRootInput') as HTMLInputElement | null)?.value || getExportRoot()).trim();
+    if (!root) {
+      if (archiveResult) archiveResult.textContent = 'Enter an export root folder first.';
+      return;
+    }
+    setExportRoot(root);
+
+    const mode = ((document.getElementById('archiveExportMode') as HTMLSelectElement | null)?.value || 'force').trim();
+
+    try {
+      if (archiveResult) archiveResult.textContent = 'Exporting selected items...';
+
+      const result = await invoke<string>('export_selected_archive', {
+        rootDir: root,
+        mode,
+        projectIds: Array.from(selectedProjectIds),
+        chatIds: Array.from(selectedChatIds),
+      });
+
+      await renderArchive();
+
+      const refreshedResult = document.getElementById('archiveActionResult');
+      if (refreshedResult) refreshedResult.textContent = `${result} Check ${root}/index.html`;
+    } catch (error) {
+      if (archiveResult) archiveResult.textContent = `Export failed: ${(error as Error).message}`;
+      console.error(error);
+    }
   });
 }
 
@@ -301,6 +404,69 @@ async function loadBundleFile(file: File): Promise<void> {
   }
 }
 
+async function readEntryFile(entry: any): Promise<File[]> {
+  return new Promise((resolve, reject) => {
+    entry.file(
+      (file: File) => resolve([file]),
+      (error: Error) => reject(error),
+    );
+  });
+}
+
+async function readAllDirectoryEntries(reader: any): Promise<any[]> {
+  const entries: any[] = [];
+
+  while (true) {
+    const batch: any[] = await new Promise((resolve, reject) => {
+      reader.readEntries(
+        (items: any[]) => resolve(items),
+        (error: Error) => reject(error),
+      );
+    });
+
+    if (!batch.length) break;
+    entries.push(...batch);
+  }
+
+  return entries;
+}
+
+async function entryToFiles(entry: any): Promise<File[]> {
+  if (!entry) return [];
+
+  if (entry.isFile) {
+    return await readEntryFile(entry);
+  }
+
+  if (entry.isDirectory) {
+    const reader = entry.createReader();
+    const entries = await readAllDirectoryEntries(reader);
+    const nested = await Promise.all(entries.map((child) => entryToFiles(child)));
+    return nested.flat();
+  }
+
+  return [];
+}
+
+async function dataTransferToFiles(dataTransfer: DataTransfer | null): Promise<File[]> {
+  if (!dataTransfer) return [];
+
+  const items = Array.from(dataTransfer.items || []);
+  const supportsEntries = items.some((item) => typeof (item as any).webkitGetAsEntry === 'function');
+
+  if (supportsEntries) {
+    const collected = await Promise.all(
+      items.map(async (item) => {
+        const entry = (item as any).webkitGetAsEntry?.();
+        return await entryToFiles(entry);
+      }),
+    );
+    return collected.flat();
+  }
+
+  return Array.from(dataTransfer.files || []);
+}
+
 function renderImport(): void {
   currentView = 'import';
   if (!content) return;
@@ -309,13 +475,16 @@ function renderImport(): void {
     'Import Wizard',
     `<h3>Import capture bundle JSON</h3>
     <div class="import-actions">
-      <button id="pickBundleFileBtn">Select JSON file</button>
-      <input id="bundleFileInput" type="file" accept=".json,application/json" hidden />
+      <button id="pickBundleFileBtn">Select JSON file(s)</button>
+      <button id="pickBundleFolderBtn">Select folder of JSON files</button>
+      <button id="chooseImportFolderBtn">Open folder into app</button>
+      <input id="bundleFileInput" type="file" accept=".json,application/json" multiple hidden />
+      <input id="bundleFolderInput" type="file" webkitdirectory directory multiple hidden />
     </div>
 
     <div id="dropZone" class="drop-zone">
-      <strong>Drop capture JSON here</strong>
-      <p class="muted">or use “Select JSON file” above</p>
+      <strong>Drop JSON file(s) or a folder here</strong>
+      <p class="muted">Folders are searched recursively for <code>.json</code> files</p>
     </div>
 
     <textarea id="bundleInput" rows="12" style="width:100%"></textarea>
@@ -332,18 +501,66 @@ function renderImport(): void {
   );
 
   const fileInput = document.getElementById('bundleFileInput') as HTMLInputElement | null;
+  const folderInput = document.getElementById('bundleFolderInput') as HTMLInputElement | null;
   const dropZone = document.getElementById('dropZone');
+  const textarea = document.getElementById('bundleInput') as HTMLTextAreaElement | null;
+  const out = document.getElementById('importResult');
 
-  async function handleDroppedFile(file: File | null | undefined) {
-    if (!file) return;
-    await loadBundleFile(file);
+  let pendingBundleFiles: File[] = [];
+
+  async function handleFiles(files: File[] | FileList | null | undefined) {
+    const jsonFiles = Array.from(files || []).filter((file) => file.name.toLowerCase().endsWith('.json'));
+    if (!jsonFiles.length) {
+      pendingBundleFiles = [];
+      if (textarea) textarea.value = '';
+      if (out) out.textContent = 'No JSON files selected.';
+      return;
+    }
+
+    pendingBundleFiles = jsonFiles;
+
+    if (jsonFiles.length === 1) {
+      await loadBundleFile(jsonFiles[0]);
+      return;
+    }
+
+    if (textarea) textarea.value = '';
+    if (out) out.textContent = `Loaded ${jsonFiles.length} JSON files. Click “Import capture bundle” to import them all.`;
   }
 
   document.getElementById('pickBundleFileBtn')?.addEventListener('click', () => fileInput?.click());
+  document.getElementById('pickBundleFolderBtn')?.addEventListener('click', () => folderInput?.click());
+
+  document.getElementById('chooseImportFolderBtn')?.addEventListener('click', async () => {
+    try {
+      const picked = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: getWatchedFolder() || getExportRoot(),
+      });
+
+      if (typeof picked !== 'string' || !picked.trim()) return;
+
+      if (out) out.textContent = `Importing JSON files from ${picked} ...`;
+      setWatchedFolder(picked);
+
+      const result = await invoke<string>('auto_import_capture_folder', {
+        folderPath: picked,
+      });
+
+      if (out) out.textContent = result;
+      await maybeRefreshArchive();
+    } catch (error) {
+      if (out) out.textContent = `Folder import failed: ${(error as Error).message}`;
+    }
+  });
 
   fileInput?.addEventListener('change', async () => {
-    const file = fileInput.files?.[0];
-    if (file) await loadBundleFile(file);
+    await handleFiles(fileInput.files);
+  });
+
+  folderInput?.addEventListener('change', async () => {
+    await handleFiles(folderInput.files);
   });
 
   dropZone?.addEventListener('dragover', (event) => {
@@ -362,30 +579,44 @@ function renderImport(): void {
     event.preventDefault();
     event.stopPropagation();
     dropZone.classList.remove('dragover');
-    await handleDroppedFile(event.dataTransfer?.files?.[0]);
-  });
-
-  window.addEventListener('dragover', (event) => event.preventDefault());
-  window.addEventListener('drop', async (event) => {
-    event.preventDefault();
-    if (currentView !== 'import') return;
-    await handleDroppedFile(event.dataTransfer?.files?.[0]);
+    const files = await dataTransferToFiles(event.dataTransfer);
+    await handleFiles(files);
   });
 
   document.getElementById('clearBundleBtn')?.addEventListener('click', () => {
-    const textarea = document.getElementById('bundleInput') as HTMLTextAreaElement | null;
-    const out = document.getElementById('importResult');
     if (textarea) textarea.value = '';
     if (fileInput) fileInput.value = '';
+    if (folderInput) folderInput.value = '';
+    pendingBundleFiles = [];
     if (out) out.textContent = '';
   });
 
   document.getElementById('importBundleBtn')?.addEventListener('click', async () => {
-    const bundle = (document.getElementById('bundleInput') as HTMLTextAreaElement).value;
-    const out = document.getElementById('importResult');
     try {
+      if (pendingBundleFiles.length > 1) {
+        let imported = 0;
+        let failed = 0;
+
+        for (const file of pendingBundleFiles) {
+          try {
+            const bundleJson = await file.text();
+            await invoke<string>('import_capture_bundle', { bundleJson });
+            imported += 1;
+          } catch {
+            failed += 1;
+          }
+        }
+
+        if (out) out.textContent = `Imported ${imported} bundle(s), failed ${failed}.`;
+        pendingBundleFiles = [];
+        await maybeRefreshArchive();
+        return;
+      }
+
+      const bundle = textarea?.value || '';
       const result = await invoke<string>('import_capture_bundle', { bundleJson: bundle });
       if (out) out.textContent = result;
+      pendingBundleFiles = [];
       await maybeRefreshArchive();
     } catch (error) {
       if (out) out.textContent = `Import failed: ${(error as Error).message}`;
@@ -394,7 +625,6 @@ function renderImport(): void {
 
   document.getElementById('importOfficialBtn')?.addEventListener('click', async () => {
     const zipPath = (document.getElementById('officialZipPath') as HTMLInputElement).value;
-    const out = document.getElementById('importResult');
     try {
       const result = await invoke<string>('import_official_export_zip', { zipPath });
       if (out) out.textContent = result;
@@ -411,27 +641,35 @@ function renderExport(): void {
 
   content.innerHTML = section(
     'Export Jobs',
-    `<label>Export root folder: <input id="exportRoot" value="/Users/n/Desktop/project-archivist" /></label>
+    `<label>Export root folder: <input id="exportRoot" value="${escapeHtml(getExportRoot())}" placeholder="/path/to/export/folder" /></label>
     <label>Mode:
       <select id="exportMode">
         <option value="incremental">incremental</option>
         <option value="force" selected>force</option>
-        <option value="repair_assets">repair_assets</option>
       </select>
     </label>
     <div class="import-actions">
       <button id="queueExportBtn">Queue workspace export</button>
+      <button id="runNowExportBtn">Queue and run now</button>
       <button id="runExportsBtn">Run queued/failed exports</button>
     </div>
     <pre id="exportResult" class="muted"></pre>`,
   );
 
   document.getElementById('queueExportBtn')?.addEventListener('click', async () => {
-    const root = (document.getElementById('exportRoot') as HTMLInputElement).value;
+    const root = (document.getElementById('exportRoot') as HTMLInputElement).value.trim();
     const mode = (document.getElementById('exportMode') as HTMLSelectElement).value;
     const out = document.getElementById('exportResult');
 
+    if (!root) {
+      if (out) out.textContent = 'Export root folder is required.';
+      return;
+    }
+
+    setExportRoot(root);
+
     try {
+      if (out) out.textContent = 'Queueing export job...';
       const result = await invoke<string>('queue_export_job', {
         target: 'workspace',
         mode,
@@ -443,9 +681,38 @@ function renderExport(): void {
     }
   });
 
+  document.getElementById('runNowExportBtn')?.addEventListener('click', async () => {
+    const root = (document.getElementById('exportRoot') as HTMLInputElement).value.trim();
+    const mode = (document.getElementById('exportMode') as HTMLSelectElement).value;
+    const out = document.getElementById('exportResult');
+
+    if (!root) {
+      if (out) out.textContent = 'Export root folder is required.';
+      return;
+    }
+
+    setExportRoot(root);
+
+    try {
+      if (out) out.textContent = 'Queueing export job...';
+      const queued = await invoke<string>('queue_export_job', {
+        target: 'workspace',
+        mode,
+        rootDir: root,
+      });
+
+      if (out) out.textContent = `${queued}\nRunning export jobs...`;
+      const result = await invoke<string>('run_pending_export_jobs');
+      if (out) out.textContent = `${queued}\n${result}`;
+    } catch (error) {
+      if (out) out.textContent = `Running exports failed: ${(error as Error).message}`;
+    }
+  });
+
   document.getElementById('runExportsBtn')?.addEventListener('click', async () => {
     const out = document.getElementById('exportResult');
     try {
+      if (out) out.textContent = 'Running queued/failed exports...';
       const result = await invoke<string>('run_pending_export_jobs');
       if (out) out.textContent = result;
     } catch (error) {
@@ -469,7 +736,7 @@ function renderSettings(): void {
 
     <h3>Auto-import watched folder</h3>
     <label>Watched folder:
-      <input id="watchedFolderInput" value="${escapeHtml(getWatchedFolder())}" style="width:100%" />
+      <input id="watchedFolderInput" value="${escapeHtml(getWatchedFolder())}" placeholder="/path/to/capture/folder" style="width:100%" />
     </label>
     <label>
       <input id="autoImportEnabledInput" type="checkbox" ${isAutoImportEnabled() ? 'checked' : ''} />
@@ -485,10 +752,10 @@ function renderSettings(): void {
   document.getElementById('saveAutoImportSettingsBtn')?.addEventListener('click', () => {
     const folder = (document.getElementById('watchedFolderInput') as HTMLInputElement).value.trim();
     const enabled = (document.getElementById('autoImportEnabledInput') as HTMLInputElement).checked;
-    setWatchedFolder(folder || '/Users/n/Desktop/project-archivist');
+    setWatchedFolder(folder);
     setAutoImportEnabled(enabled);
     ensureAutoImportPolling();
-    setStatusText('autoImportResult', `Saved. Watching: ${getWatchedFolder()} (${enabled ? 'enabled' : 'disabled'})`);
+    setStatusText('autoImportResult', `Saved. Watching: ${getWatchedFolder() || '(none)'} (${enabled ? 'enabled' : 'disabled'})`);
   });
 
   document.getElementById('runAutoImportNowBtn')?.addEventListener('click', async () => {

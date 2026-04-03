@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "local.project.archivist",
   "build": {
-    "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build",
+    "beforeDevCommand": "pnpm frontend:dev",
+    "beforeBuildCommand": "pnpm frontend:build",
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173"
   },

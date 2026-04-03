@@ -7,3 +7,6 @@ pnpm-lock.yaml
 /apps/desktop/src-tauri/target
 /apps/desktop/src-tauri/gen
 *.log
+/apps/extension/dist
+/apps/desktop/src-tauri/project_archivist.db
+*.db

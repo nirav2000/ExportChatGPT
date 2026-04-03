@@ -200,14 +200,14 @@ function renderStructure(scan) {
   currentScan = scan || null;
 
   if (!scan) {
-    structureSummaryEl.textContent = 'No project scan yet.';
+    structureSummaryEl.textContent = 'No scan yet.';
     structureTreeEl.innerHTML = '';
     return;
   }
 
   const projects = scan.projects || [];
   const ungrouped = scan.ungroupedChats || [];
-  structureSummaryEl.textContent = `Projects: ${projects.length} • Project chats: ${(scan.chats || []).length} • Ungrouped: ${ungrouped.length}`;
+  structureSummaryEl.textContent = `Projects: ${projects.length} • Project chats: ${(scan.chats || []).length} • Standalone: ${ungrouped.length}`;
 
   let html = '';
 
@@ -218,7 +218,7 @@ function renderStructure(scan) {
   html += renderGroup(
     {
       id: 'ungrouped',
-      name: 'Ungrouped / No project',
+      name: 'Standalone chats',
       chats: ungrouped,
     },
     'ungrouped'
@@ -330,11 +330,7 @@ async function refreshUi() {
     resultEl.textContent = JSON.stringify(snapshot.currentProjectScan, null, 2);
     return;
   }
-  if (snapshot?.lastCapture) {
-    resultEl.textContent = JSON.stringify(snapshot.lastCapture, null, 2);
-    return;
-  }
-  resultEl.textContent = 'No capture yet.';
+  resultEl.textContent = 'No scan yet.';
 }
 
 function startPolling() {
@@ -351,16 +347,21 @@ function stopPolling() {
   }
 }
 
-async function doCapture() {
-  setState('capturing');
-  resultEl.textContent = 'Capturing current chat...';
-  const response = await chrome.runtime.sendMessage({ type: 'capture-current-chat' });
-  if (!response?.ok) {
-    setState('failed');
-    resultEl.textContent = `Capture failed: ${response?.error || 'Unknown error'}`;
-    return;
+async function doScanStandalone() {
+  setState('scanning');
+  resultEl.textContent = 'Scanning standalone chats...';
+  startPolling();
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'scan-standalone-chats' });
+    if (!response?.ok) {
+      setState('failed');
+      resultEl.textContent = `Standalone scan failed: ${response?.error || 'Unknown error'}`;
+      return;
+    }
+    await refreshUi();
+  } finally {
+    stopPolling();
   }
-  await refreshUi();
 }
 
 async function doScanProject() {
@@ -378,17 +379,6 @@ async function doScanProject() {
   } finally {
     stopPolling();
   }
-}
-
-async function doExportCurrentChat() {
-  setState('downloading');
-  const response = await chrome.runtime.sendMessage({ type: 'download-last-bundle' });
-  if (!response?.ok) {
-    setState('failed');
-    resultEl.textContent = `Download failed: ${response?.error || 'Unknown error'}`;
-    return;
-  }
-  await refreshUi();
 }
 
 async function doExportSelectedGroups() {
@@ -526,8 +516,7 @@ document.getElementById('requestPerm')?.addEventListener('click', async () => {
   await updatePermissionState();
 });
 
-document.getElementById('scan')?.addEventListener('click', doCapture);
-document.getElementById('exportChat')?.addEventListener('click', doExportCurrentChat);
+document.getElementById('scanStandalone')?.addEventListener('click', doScanStandalone);
 document.getElementById('scanProject')?.addEventListener('click', doScanProject);
 document.getElementById('exportSelectedGroups')?.addEventListener('click', doExportSelectedGroups);
 document.getElementById('exportSelectedChats')?.addEventListener('click', doExportSelectedChats);

@@ -65,6 +65,13 @@ function sanitizeId(input) {
     .slice(0, 80);
 }
 
+function chatIdFromHref(href, fallbackTitle = '') {
+  const normalized = normalizeHref(href);
+  const match = normalized.match(/\/c\/([^/?#]+)/);
+  if (match?.[1]) return `chat-${match[1]}`;
+  return `chat-${sanitizeId(fallbackTitle || normalized)}`;
+}
+
 function uniqueBy(items, keyFn) {
   const seen = new Set();
   const out = [];
@@ -87,6 +94,83 @@ function currentProjectName() {
   if (heading) return heading;
 
   return null;
+}
+
+function activeChatAnchor() {
+  const direct = document.querySelector('a[href*="/c/"][aria-current="page"]');
+  if (direct instanceof HTMLAnchorElement) return direct;
+
+  const currentNode = document.querySelector('[aria-current="page"]');
+  if (currentNode instanceof HTMLElement) {
+    const anchor = currentNode.closest('a[href*="/c/"]');
+    if (anchor instanceof HTMLAnchorElement) return anchor;
+    const nested = currentNode.querySelector('a[href*="/c/"]');
+    if (nested instanceof HTMLAnchorElement) return nested;
+  }
+
+  const pathnameMatch = location.pathname.match(/\/c\/([^/?#]+)/);
+  if (pathnameMatch?.[1]) {
+    const exact = document.querySelector(`a[href*="/c/${pathnameMatch[1]}"]`);
+    if (exact instanceof HTMLAnchorElement) return exact;
+  }
+
+  return null;
+}
+
+function visibleChatLinks(root = document) {
+  const selectors = [
+    'aside a[href*="/c/"]',
+    'nav a[href*="/c/"]',
+    '[role="navigation"] a[href*="/c/"]',
+    'a[href*="/c/"]'
+  ];
+
+  const links = [];
+  for (const selector of selectors) {
+    for (const a of root.querySelectorAll(selector)) {
+      if (a instanceof HTMLAnchorElement) links.push(a);
+    }
+  }
+
+  return uniqueBy(
+    links
+      .filter((a) => normalizeHref(a.getAttribute('href') || '').includes('/c/'))
+      .filter((a) => (a.textContent || '').trim().length > 0),
+    (a) => normalizeHref(a.getAttribute('href') || '')
+  );
+}
+
+function findChatGroupContainer(anchor) {
+  if (!(anchor instanceof HTMLAnchorElement)) return null;
+
+  const navRoot =
+    anchor.closest('aside, nav, [role="navigation"]') ||
+    document.querySelector('aside, nav, [role="navigation"]');
+
+  let node = anchor.parentElement;
+  let best = null;
+
+  while (node) {
+    const links = Array.from(node.querySelectorAll('a[href*="/c/"]'));
+    if (links.some((link) => link === anchor) && links.length >= 1 && links.length <= 50) {
+      best = node;
+    }
+
+    if (node === navRoot) break;
+    node = node.parentElement;
+  }
+
+  return best || navRoot || anchor.parentElement || null;
+}
+
+function linkToChat(a, projectId = null, projectName = null) {
+  return {
+    id: chatIdFromHref(a.getAttribute('href') || '', (a.textContent || '').trim()),
+    title: (a.textContent || '').trim() || 'Untitled Chat',
+    href: normalizeHref(a.getAttribute('href') || ''),
+    projectId,
+    projectName,
+  };
 }
 
 function extractChatPayload() {
@@ -130,123 +214,85 @@ function extractChatPayload() {
   };
 }
 
-function gatherAllChatLinks() {
-  const selectors = [
-    'aside a[href*="/c/"]',
-    'nav a[href*="/c/"]',
-    '[role="navigation"] a[href*="/c/"]',
-    'a[href*="/c/"]'
-  ];
-
-  const links = [];
-  for (const selector of selectors) {
-    for (const a of document.querySelectorAll(selector)) {
-      if (a instanceof HTMLAnchorElement) links.push(a);
-    }
-  }
-
-  return uniqueBy(
-    links
-      .map((a) => ({
-        title: (a.textContent || '').trim() || 'Untitled Chat',
-        href: normalizeHref(a.getAttribute('href') || ''),
-        element: a,
-      }))
-      .filter((c) => c.href.includes('/c/')),
-    (c) => `${c.href}|${c.title}`
-  );
-}
-
 function scanCurrentProjectNav() {
   const projectName = currentProjectName();
   const projectId = projectName ? `project-${sanitizeId(projectName)}` : null;
   const warnings = [];
-  const allChatLinks = gatherAllChatLinks();
 
-  const grouped = [];
-  const ungrouped = [];
+  const activeAnchor = activeChatAnchor();
+  const groupContainer = activeAnchor ? findChatGroupContainer(activeAnchor) : null;
 
-  for (const chat of allChatLinks) {
-    const text = (chat.element.closest('li,div,section')?.textContent || '').trim();
-    const label = text || chat.title;
+  let links = groupContainer ? visibleChatLinks(groupContainer) : [];
 
-    const hasProjectSignal =
-      !!projectName &&
-      label.includes(projectName);
-
-    if (hasProjectSignal) {
-      grouped.push({
-        id: `chat-${sanitizeId(chat.title || chat.href)}`,
-        title: chat.title,
-        href: chat.href,
-        projectId,
-        projectName,
-      });
-    } else {
-      ungrouped.push({
-        id: `chat-${sanitizeId(chat.title || chat.href)}`,
-        title: chat.title,
-        href: chat.href,
-        projectId: null,
-        projectName: null,
-      });
-    }
+  if (!links.length) {
+    const navRoot =
+      document.querySelector('aside, nav, [role="navigation"]') ||
+      document;
+    links = visibleChatLinks(navRoot).filter((a) => {
+      const rowText = (a.closest('li,div,section,article')?.textContent || '').trim();
+      return projectName ? rowText.includes(projectName) : false;
+    });
+    if (links.length) warnings.push('Used project-name fallback for current project scan');
   }
 
-  let finalGrouped = grouped;
-  let finalUngrouped = ungrouped;
-
-  if (!finalGrouped.length && projectName) {
-    const selectedContainer = document.querySelector('aside, nav, [role="navigation"]');
-    const nearbyLinks = selectedContainer
-      ? uniqueBy(
-          Array.from(selectedContainer.querySelectorAll('a[href*="/c/"]')).map((a) => ({
-            id: `chat-${sanitizeId(a.textContent?.trim() || a.getAttribute('href') || '')}`,
-            title: (a.textContent || '').trim() || 'Untitled Chat',
-            href: normalizeHref(a.getAttribute('href') || ''),
-            projectId,
-            projectName,
-          })),
-          (c) => `${c.href}|${c.title}`
-        )
-      : [];
-
-    if (nearbyLinks.length) {
-      finalGrouped = nearbyLinks;
-      finalUngrouped = allChatLinks
-        .filter((c) => !nearbyLinks.some((g) => g.href === c.href))
-        .map((c) => ({
-          id: `chat-${sanitizeId(c.title || c.href)}`,
-          title: c.title,
-          href: c.href,
-          projectId: null,
-          projectName: null,
-        }));
-      warnings.push('Used sidebar-local fallback grouping for current project');
-    }
-  }
+  const chats = uniqueBy(
+    links.map((a) => linkToChat(a, projectId, projectName)),
+    (c) => c.id
+  );
 
   if (!projectName) warnings.push('Could not confidently identify current project name');
-  if (!finalGrouped.length) warnings.push('No chats were confidently linked to the current project');
-  if (!allChatLinks.length) warnings.push('No chat links found in visible DOM');
+  if (!groupContainer) warnings.push('Could not isolate project container from current chat');
+  if (!chats.length) warnings.push('No chats found for the current project');
 
   return {
     detectedAt: new Date().toISOString(),
+    mode: 'current-project',
+    warnings,
     projects: projectName
       ? [{
           id: projectId,
           name: projectName,
-          chats: finalGrouped.map((c) => ({
+          chats: chats.map((c) => ({
             id: c.id,
             title: c.title,
             href: c.href,
           })),
         }]
       : [],
-    chats: finalGrouped,
-    ungroupedChats: finalUngrouped,
+    chats,
+    ungroupedChats: [],
+  };
+}
+
+function scanStandaloneChatsNav() {
+  const warnings = [];
+  const activeAnchor = activeChatAnchor();
+  const groupContainer = activeAnchor ? findChatGroupContainer(activeAnchor) : null;
+  const navRoot =
+    document.querySelector('aside, nav, [role="navigation"]') ||
+    document;
+
+  let links = visibleChatLinks(navRoot);
+
+  if (groupContainer) {
+    links = links.filter((a) => !groupContainer.contains(a));
+    warnings.push('Excluded the currently open project container from standalone scan');
+  }
+
+  const chats = uniqueBy(
+    links.map((a) => linkToChat(a, null, null)),
+    (c) => c.id
+  );
+
+  if (!chats.length) warnings.push('No standalone chats found in the visible navigation');
+
+  return {
+    detectedAt: new Date().toISOString(),
+    mode: 'standalone-chats',
     warnings,
-    mode: 'current-project',
+    projects: [],
+    chats: [],
+    ungroupedChats: chats,
   };
 }
 
@@ -254,4 +300,5 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'ping') return sendResponse({ ok: true });
   if (message.type === 'extract-chat') return sendResponse(extractChatPayload());
   if (message.type === 'scan-current-project-nav') return sendResponse(scanCurrentProjectNav());
+  if (message.type === 'scan-standalone-nav') return sendResponse(scanStandaloneChatsNav());
 });

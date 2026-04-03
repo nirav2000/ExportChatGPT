@@ -6,10 +6,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
 };
+use tauri::Manager;
 use zip::ZipArchive;
 
 struct AppState {
@@ -104,6 +105,8 @@ struct Message {
     role: String,
     #[serde(rename = "rawHtml")]
     raw_html: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +153,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
           chat_id TEXT NOT NULL,
           role TEXT NOT NULL,
           body TEXT,
+          sort_index INTEGER NOT NULL DEFAULT 0,
           created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS assets (
@@ -174,6 +178,26 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         ",
     )?;
+
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN sort_index INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    let _ = conn.execute_batch(
+        "
+        WITH ordered AS (
+          SELECT rowid, ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY rowid) - 1 AS rn
+          FROM messages
+        )
+        UPDATE messages
+        SET sort_index = (
+          SELECT rn FROM ordered WHERE ordered.rowid = messages.rowid
+        )
+        WHERE sort_index = 0;
+        ",
+    );
+
     Ok(())
 }
 
@@ -186,7 +210,8 @@ fn ensure_default_workspace(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn chat_fingerprint(conn: &Connection, chat_id: &str) -> rusqlite::Result<String> {
-    let mut stmt = conn.prepare("SELECT role, body FROM messages WHERE chat_id = ?1 ORDER BY id")?;
+    let mut stmt =
+        conn.prepare("SELECT role, body FROM messages WHERE chat_id = ?1 ORDER BY sort_index, id")?;
     let rows = stmt.query_map(params![chat_id], |row| {
         let role: String = row.get(0)?;
         let body: String = row.get(1)?;
@@ -228,26 +253,50 @@ fn escape_html(input: &str) -> String {
 
 #[tauri::command]
 fn diagnostics_health(state: tauri::State<AppState>) -> Result<Health, String> {
-    let conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
     ensure_default_workspace(&conn).map_err(|e| e.to_string())?;
-    Ok(Health { status: "ok".into() })
+    Ok(Health {
+        status: "ok".into(),
+    })
 }
 
 #[tauri::command]
 fn diagnostics_report(state: tauri::State<AppState>) -> Result<Diagnostics, String> {
-    let conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     let queued_jobs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM export_jobs WHERE status = 'queued'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM export_jobs WHERE status = 'queued'",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
     let failed_jobs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM export_jobs WHERE status = 'failed'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM export_jobs WHERE status = 'failed'",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
     let resumable_jobs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM export_jobs WHERE status IN ('failed', 'running')", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM export_jobs WHERE status IN ('failed', 'running')",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
     let missing_markdown_exports: i64 = conn
-        .query_row("SELECT COUNT(*) FROM chats WHERE exported_fingerprint IS NULL", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM chats WHERE exported_fingerprint IS NULL",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|e| e.to_string())?;
 
     Ok(Diagnostics {
@@ -260,7 +309,10 @@ fn diagnostics_report(state: tauri::State<AppState>) -> Result<Diagnostics, Stri
 
 #[tauri::command]
 fn list_projects_chats(state: tauri::State<AppState>) -> Result<Vec<ProjectChatRow>, String> {
-    let conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
@@ -294,7 +346,10 @@ fn list_projects_chats(state: tauri::State<AppState>) -> Result<Vec<ProjectChatR
 
 #[tauri::command]
 fn list_archive_tree(state: tauri::State<AppState>) -> Result<ArchiveTree, String> {
-    let conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
@@ -339,12 +394,14 @@ fn list_archive_tree(state: tauri::State<AppState>) -> Result<ArchiveTree, Strin
 
     for chat in rows {
         if let (Some(pid), Some(pname)) = (chat.project_id.clone(), chat.project_name.clone()) {
-            let entry = by_project.entry(pid.clone()).or_insert_with(|| ArchiveProjectNode {
-                id: pid.clone(),
-                name: pname.clone(),
-                chats: vec![],
-                changed: false,
-            });
+            let entry = by_project
+                .entry(pid.clone())
+                .or_insert_with(|| ArchiveProjectNode {
+                    id: pid.clone(),
+                    name: pname.clone(),
+                    chats: vec![],
+                    changed: false,
+                });
             if chat.changed {
                 entry.changed = true;
             }
@@ -358,7 +415,66 @@ fn list_archive_tree(state: tauri::State<AppState>) -> Result<ArchiveTree, Strin
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     standalone.sort_by(|a, b| a.title.cmp(&b.title));
 
-    Ok(ArchiveTree { projects, standalone })
+    Ok(ArchiveTree {
+        projects,
+        standalone,
+    })
+}
+
+fn export_dir_for_chat(
+    root: &str,
+    chat_id: &str,
+    title: &str,
+    project_name: Option<&str>,
+) -> PathBuf {
+    let folder = sanitize_for_fs(&format!("{} - {}", chat_id, title));
+    if let Some(project_name) = project_name {
+        Path::new(root)
+            .join("Project Archivist Export")
+            .join("projects")
+            .join(sanitize_for_fs(project_name))
+            .join("chats")
+            .join(folder)
+    } else {
+        Path::new(root)
+            .join("Project Archivist Export")
+            .join("standalone-chats")
+            .join(folder)
+    }
+}
+
+fn remove_empty_parent_dirs(mut current: PathBuf, stop_at: &Path) {
+    while current.starts_with(stop_at) && current != stop_at {
+        if current.exists() {
+            match fs::remove_dir(&current) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => break,
+            }
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+}
+
+fn remove_chat_export(
+    root: &str,
+    chat_id: &str,
+    title: &str,
+    project_name: Option<&str>,
+) -> Result<(), String> {
+    let dir = export_dir_for_chat(root, chat_id, title, project_name);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        let export_root = Path::new(root).join("Project Archivist Export");
+        if let Some(parent) = dir.parent() {
+            remove_empty_parent_dirs(parent.to_path_buf(), &export_root);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -366,8 +482,12 @@ fn delete_archive_items(
     state: tauri::State<AppState>,
     project_ids: Vec<String>,
     chat_ids: Vec<String>,
+    root_dir: String,
 ) -> Result<String, String> {
-    let mut conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let mut conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
 
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -390,6 +510,24 @@ fn delete_archive_items(
     all_chat_ids.sort();
     all_chat_ids.dedup();
 
+    let mut export_entries: Vec<(String, String, Option<String>)> = Vec::new();
+    for cid in &all_chat_ids {
+        let meta: Result<(String, Option<String>), _> = tx.query_row(
+            "
+            SELECT c.title, p.name
+            FROM chats c
+            LEFT JOIN projects p ON p.id = c.project_id
+            WHERE c.id = ?1
+            ",
+            params![cid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+
+        if let Ok((title, project_name)) = meta {
+            export_entries.push((cid.clone(), title, project_name));
+        }
+    }
+
     for cid in &all_chat_ids {
         tx.execute("DELETE FROM assets WHERE chat_id = ?1", params![cid])
             .map_err(|e| e.to_string())?;
@@ -411,7 +549,19 @@ fn delete_archive_items(
     .map_err(|e| e.to_string())?;
 
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(format!("Removed {} chat(s) and {} project(s)", all_chat_ids.len(), project_ids.len()))
+
+    if !root_dir.trim().is_empty() {
+        for (chat_id, title, project_name) in &export_entries {
+            let _ = remove_chat_export(&root_dir, chat_id, title, project_name.as_deref());
+        }
+        let _ = build_archive_index_html(&conn, &root_dir);
+    }
+
+    Ok(format!(
+        "Removed {} chat(s) and {} project(s)",
+        all_chat_ids.len(),
+        project_ids.len()
+    ))
 }
 
 fn rand_id() -> String {
@@ -423,26 +573,37 @@ fn rand_id() -> String {
 }
 
 #[tauri::command]
-fn import_capture_bundle(state: tauri::State<AppState>, bundle_json: String) -> Result<String, String> {
+fn import_capture_bundle(
+    state: tauri::State<AppState>,
+    bundle_json: String,
+) -> Result<String, String> {
     let bundle: CaptureBundle =
         serde_json::from_str(&bundle_json).map_err(|e| format!("invalid bundle: {}", e))?;
-    let mut conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let mut conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
+
+    let workspace_id = bundle.workspace.id.clone();
+    let workspace_name = bundle
+        .workspace
+        .name
+        .clone()
+        .unwrap_or("Default Workspace".to_string());
+
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
     tx.execute(
         "INSERT OR REPLACE INTO workspaces (id, name) VALUES (?1, ?2)",
-        params![
-            bundle.workspace.id,
-            bundle.workspace.name.unwrap_or("Default Workspace".to_string())
-        ],
+        params![workspace_id, workspace_name],
     )
     .map_err(|e| e.to_string())?;
 
     for p in bundle.projects {
         tx.execute(
             "INSERT OR REPLACE INTO projects (id, workspace_id, name) VALUES (?1, ?2, ?3)",
-            params![p.id, "default", p.name],
+            params![p.id, workspace_id, p.name],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -450,17 +611,20 @@ fn import_capture_bundle(state: tauri::State<AppState>, bundle_json: String) -> 
     for c in bundle.chats {
         tx.execute(
             "INSERT OR REPLACE INTO chats (id, workspace_id, project_id, title, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![c.id, "default", c.project_id, c.title, c.fingerprint, c.updated_at],
+            params![c.id, workspace_id, c.project_id, c.title, c.fingerprint, c.updated_at],
         )
         .map_err(|e| e.to_string())?;
     }
 
+    let mut message_index_by_chat: HashMap<String, i64> = HashMap::new();
     for m in bundle.messages {
+        let sort_index = message_index_by_chat.entry(m.chat_id.clone()).or_insert(0);
         tx.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, role, body) VALUES (?1, ?2, ?3, ?4)",
-            params![m.id, m.chat_id, m.role, m.raw_html.unwrap_or_default()],
+            "INSERT OR REPLACE INTO messages (id, chat_id, role, body, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, CURRENT_TIMESTAMP))",
+            params![m.id, m.chat_id, m.role, m.raw_html.unwrap_or_default(), *sort_index, m.created_at],
         )
         .map_err(|e| e.to_string())?;
+        *sort_index += 1;
     }
 
     for a in bundle.assets {
@@ -476,7 +640,10 @@ fn import_capture_bundle(state: tauri::State<AppState>, bundle_json: String) -> 
 }
 
 #[tauri::command]
-fn import_official_export_zip(state: tauri::State<AppState>, zip_path: String) -> Result<String, String> {
+fn import_official_export_zip(
+    state: tauri::State<AppState>,
+    zip_path: String,
+) -> Result<String, String> {
     let file = fs::File::open(&zip_path).map_err(|e| format!("zip open failed: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("invalid zip: {}", e))?;
     let mut conversations = String::new();
@@ -484,7 +651,8 @@ fn import_official_export_zip(state: tauri::State<AppState>, zip_path: String) -
     for i in 0..archive.len() {
         let mut f = archive.by_index(i).map_err(|e| e.to_string())?;
         if f.name().ends_with("conversations.json") {
-            f.read_to_string(&mut conversations).map_err(|e| e.to_string())?;
+            f.read_to_string(&mut conversations)
+                .map_err(|e| e.to_string())?;
             break;
         }
     }
@@ -495,7 +663,10 @@ fn import_official_export_zip(state: tauri::State<AppState>, zip_path: String) -
 
     let parsed: Vec<OfficialConversation> =
         serde_json::from_str(&conversations).map_err(|e| format!("json parse failed: {}", e))?;
-    let mut conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let mut conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
     ensure_default_workspace(&conn).map_err(|e| e.to_string())?;
     conn.execute(
@@ -515,10 +686,18 @@ fn import_official_export_zip(state: tauri::State<AppState>, zip_path: String) -
         .map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(format!("Imported {} official conversations", imported_count))
+    Ok(format!(
+        "Imported {} official conversations",
+        imported_count
+    ))
 }
 
-fn write_chat_export(conn: &Connection, root: &str, chat_id: &str, title: &str) -> Result<(), String> {
+fn write_chat_export(
+    conn: &Connection,
+    root: &str,
+    chat_id: &str,
+    title: &str,
+) -> Result<(), String> {
     let project_name: Option<String> = conn
         .query_row(
             "SELECT p.name FROM chats c LEFT JOIN projects p ON p.id = c.project_id WHERE c.id = ?1",
@@ -527,24 +706,11 @@ fn write_chat_export(conn: &Connection, root: &str, chat_id: &str, title: &str) 
         )
         .ok();
 
-    let folder = sanitize_for_fs(&format!("{} - {}", chat_id, title));
-    let dir = if let Some(project_name) = project_name {
-        Path::new(root)
-            .join("Project Archivist Export")
-            .join("projects")
-            .join(sanitize_for_fs(&project_name))
-            .join("chats")
-            .join(folder)
-    } else {
-        Path::new(root)
-            .join("Project Archivist Export")
-            .join("standalone-chats")
-            .join(folder)
-    };
+    let dir = export_dir_for_chat(root, chat_id, title, project_name.as_deref());
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
-        .prepare("SELECT id, role, body FROM messages WHERE chat_id = ?1 ORDER BY id")
+        .prepare("SELECT id, role, body FROM messages WHERE chat_id = ?1 ORDER BY sort_index, id")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![chat_id], |row| {
@@ -566,8 +732,10 @@ fn write_chat_export(conn: &Connection, root: &str, chat_id: &str, title: &str) 
     fs::write(dir.join("chat.md"), &md).map_err(|e| e.to_string())?;
     fs::write(
         dir.join("chat.json"),
-        serde_json::to_string_pretty(&serde_json::json!({ "id": chat_id, "title": title, "messages": json_lines }))
-            .map_err(|e| e.to_string())?,
+        serde_json::to_string_pretty(
+            &serde_json::json!({ "id": chat_id, "title": title, "messages": json_lines }),
+        )
+        .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
 
@@ -624,110 +792,323 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
     for pname in project_names {
         let mut chats = projects.remove(&pname).unwrap_or_default();
         chats.sort_by(|a, b| a.0.cmp(&b.0));
+
         let items = chats
             .into_iter()
-            .map(|(title, rel)| format!(r#"<li class="chat-item"><a href="{}" target="_blank">{}</a></li>"#, rel, escape_html(&title)))
+            .map(|(title, rel)| {
+                format!(
+                    r#"<button class="nav-chat" type="button" data-html="{}" data-title="{}"><span class="nav-chat-title">{}</span></button>"#,
+                    escape_html(&rel),
+                    escape_html(&title),
+                    escape_html(&title)
+                )
+            })
             .collect::<Vec<_>>()
             .join("");
+
         project_sections.push_str(&format!(
-            r#"<details open class="project-group"><summary>{}</summary><ul>{}</ul></details>"#,
+            r#"<section class="nav-group"><div class="nav-group-title">{}</div>{}</section>"#,
             escape_html(&pname),
             items
         ));
     }
 
-    standalone.sort_by(|a, b| a.0.cmp(&b.0));
-    let standalone_html = standalone
-        .into_iter()
-        .map(|(title, rel)| format!(r#"<li class="chat-item"><a href="{}" target="_blank">{}</a></li>"#, rel, escape_html(&title)))
-        .collect::<Vec<_>>()
-        .join("");
+    let standalone_section = if standalone.is_empty() {
+        String::new()
+    } else {
+        let mut chats = standalone;
+        chats.sort_by(|a, b| a.0.cmp(&b.0));
+        let items = chats
+            .into_iter()
+            .map(|(title, rel)| {
+                format!(
+                    r#"<button class="nav-chat" type="button" data-html="{}" data-title="{}"><span class="nav-chat-title">{}</span></button>"#,
+                    escape_html(&rel),
+                    escape_html(&title),
+                    escape_html(&title)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
 
-    let html = format!(
-        r#"<!doctype html>
+        format!(
+            r#"<section class="nav-group"><div class="nav-group-title">Standalone chats</div>{}</section>"#,
+            items
+        )
+    };
+
+    let html_template = r#"<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Project Archivist Export Index</title>
+  <title>Project Archivist Export</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #111827; color: #e5e7eb; }}
-    .wrap {{ display: grid; grid-template-columns: 320px 1fr; min-height: 100vh; }}
-    .sidebar {{ border-right: 1px solid #374151; padding: 16px; background: #0f172a; overflow:auto; transition: width .2s ease, padding .2s ease, opacity .2s ease; }}
-    .sidebar.collapsed {{ width: 0; padding: 0; opacity: 0; overflow: hidden; border-right: none; }}
-    .main {{ padding: 0; display:flex; flex-direction:column; min-width:0; }}
-    .topbar {{ display:flex; gap:8px; align-items:center; padding:12px; border-bottom:1px solid #374151; background:#0b1220; }}
-    input {{ width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: #e5e7eb; }}
-    details {{ margin: 10px 0; border: 1px solid #334155; border-radius: 8px; padding: 8px; background: #111827; }}
-    summary {{ cursor: pointer; font-weight: 600; }}
-    ul {{ margin: 8px 0 0; padding-left: 18px; }}
-    a {{ color: #93c5fd; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    .muted {{ color: #94a3b8; }}
-    .chat-item.hidden, .project-group.hidden {{ display: none; }}
-    iframe {{ width:100%; height:calc(100vh - 54px); border:0; background:white; }}
-    button {{ padding:8px 12px; border-radius:8px; border:1px solid #475569; background:#111827; color:#e5e7eb; cursor:pointer; }}
+    :root {
+      color-scheme: dark;
+      --bg: #212121;
+      --panel: #171717;
+      --border: #3f3f46;
+      --text: #ececec;
+      --muted: #a1a1aa;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      background: #171717;
+      border-right: 1px solid var(--border);
+      padding: 14px;
+      overflow-y: auto;
+    }
+
+    .sidebar h1 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .search {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #212121;
+      color: var(--text);
+      margin-bottom: 14px;
+    }
+
+    .nav-group {
+      margin-bottom: 16px;
+    }
+
+    .nav-group.hidden {
+      display: none;
+    }
+
+    .nav-group-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      margin: 8px 6px;
+    }
+
+    .nav-chat {
+      width: 100%;
+      text-align: left;
+      display: block;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text);
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background .15s ease, border-color .15s ease;
+    }
+
+    .nav-chat:hover {
+      background: #2a2a2a;
+    }
+
+    .nav-chat.active {
+      background: #2f2f2f;
+      border-color: #4b5563;
+    }
+
+    .nav-chat.hidden {
+      display: none;
+    }
+
+    .nav-chat-title {
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 14px;
+      line-height: 1.3;
+    }
+
+    .main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      background: var(--bg);
+    }
+
+    .topbar {
+      padding: 16px 24px 10px;
+      border-bottom: 1px solid rgba(255,255,255,.05);
+      background: rgba(33,33,33,.96);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      backdrop-filter: blur(12px);
+    }
+
+    .title {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .viewer-wrap {
+      flex: 1;
+      min-height: 0;
+      padding: 0;
+    }
+
+    iframe {
+      width: 100%;
+      height: calc(100vh - 71px);
+      border: 0;
+      background: #212121;
+    }
+
+    .empty {
+      height: calc(100vh - 71px);
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      padding: 24px;
+      text-align: center;
+    }
+
+    @media (max-width: 900px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        max-height: 240px;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+      }
+
+      iframe, .empty {
+        height: 60vh;
+      }
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="sidebar" id="sidebar">
-      <h2>Exports</h2>
-      <input id="search" placeholder="Search projects or chats" />
-      <div id="tree">
-        {}
-        <details open class="project-group">
-          <summary>Standalone chats</summary>
-          <ul>{}</ul>
-        </details>
+  <div class="app">
+    <aside class="sidebar">
+      <h1>Project Archivist Export</h1>
+      <input id="sidebarSearch" class="search" placeholder="Search chats" />
+      <div id="sidebarNav">
+        __PROJECT_SECTIONS__
+        __STANDALONE_SECTION__
       </div>
-    </div>
-    <div class="main">
+    </aside>
+
+    <main class="main">
       <div class="topbar">
-        <button id="toggleSidebar">Hide sidebar</button>
-        <span class="muted">Open chats in the viewer below.</span>
+        <h2 id="conversationTitle" class="title">Select a chat</h2>
+        <div id="conversationMeta" class="meta">Choose a conversation from the sidebar.</div>
       </div>
-      <iframe id="viewer" src="about:blank"></iframe>
-    </div>
+
+      <div class="viewer-wrap">
+        <iframe id="viewer" src="about:blank"></iframe>
+        <div id="emptyState" class="empty">Select a chat from the sidebar to view it here.</div>
+      </div>
+    </main>
   </div>
+
   <script>
-    const search = document.getElementById('search');
-    const sidebar = document.getElementById('sidebar');
+    const sidebarSearch = document.getElementById('sidebarSearch');
+    const navButtons = Array.from(document.querySelectorAll('.nav-chat'));
+    const navGroups = Array.from(document.querySelectorAll('.nav-group'));
+    const conversationTitle = document.getElementById('conversationTitle');
+    const conversationMeta = document.getElementById('conversationMeta');
     const viewer = document.getElementById('viewer');
-    const toggleBtn = document.getElementById('toggleSidebar');
+    const emptyState = document.getElementById('emptyState');
 
-    search.addEventListener('input', () => {{
-      const q = search.value.toLowerCase();
-      document.querySelectorAll('.project-group').forEach(group => {{
-        const text = group.textContent.toLowerCase();
-        group.classList.toggle('hidden', q && !text.includes(q));
-      }});
-      document.querySelectorAll('.chat-item').forEach(item => {{
-        const text = item.textContent.toLowerCase();
-        item.classList.toggle('hidden', q && !text.includes(q));
-      }});
-    }});
+    function loadConversation(button) {
+      const path = button.getAttribute('data-html');
+      if (!path) return;
 
-    toggleBtn.addEventListener('click', () => {{
-      sidebar.classList.toggle('collapsed');
-      toggleBtn.textContent = sidebar.classList.contains('collapsed') ? 'Show sidebar' : 'Hide sidebar';
-    }});
+      navButtons.forEach((btn) => btn.classList.remove('active'));
+      button.classList.add('active');
 
-    document.querySelectorAll('#tree a').forEach(a => {{
-      a.addEventListener('click', (e) => {{
-        e.preventDefault();
-        viewer.src = a.getAttribute('href');
-        sidebar.classList.add('collapsed');
-        toggleBtn.textContent = 'Show sidebar';
-      }});
-    }});
+      conversationTitle.textContent = button.getAttribute('data-title') || 'Untitled Chat';
+      conversationMeta.textContent = path;
+      viewer.src = path;
+      viewer.style.display = 'block';
+      emptyState.style.display = 'none';
+    }
+
+    sidebarSearch.addEventListener('input', () => {
+      const q = sidebarSearch.value.trim().toLowerCase();
+
+      navButtons.forEach((button) => {
+        const title = (button.getAttribute('data-title') || '').toLowerCase();
+        button.classList.toggle('hidden', !!q && !title.includes(q));
+      });
+
+      navGroups.forEach((group) => {
+        const visibleButtons = Array.from(group.querySelectorAll('.nav-chat')).some(
+          (button) => !button.classList.contains('hidden'),
+        );
+        group.classList.toggle('hidden', !visibleButtons);
+      });
+    });
+
+    navButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        loadConversation(button);
+      });
+    });
+
+    if (navButtons.length) {
+      loadConversation(navButtons[0]);
+    } else {
+      viewer.style.display = 'none';
+      emptyState.style.display = 'grid';
+    }
   </script>
 </body>
-</html>"#,
-        project_sections,
-        standalone_html
-    );
+</html>"#;
+
+    let mut html = html_template.replace("__PROJECT_SECTIONS__", &project_sections);
+    html = html.replace("__STANDALONE_SECTION__", &standalone_section);
 
     fs::write(export_root.join("index.html"), html).map_err(|e| e.to_string())?;
+
+    let launcher = r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Project Archivist Export</title>
+  <meta http-equiv="refresh" content="0; url=./Project%20Archivist%20Export/index.html" />
+</head>
+<body>
+  <p>Open <a href="./Project%20Archivist%20Export/index.html">Project Archivist Export</a>.</p>
+</body>
+</html>"#;
+
+    fs::write(Path::new(root).join("index.html"), launcher).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -739,7 +1120,10 @@ fn export_selected_archive(
     project_ids: Vec<String>,
     chat_ids: Vec<String>,
 ) -> Result<String, String> {
-    let conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
 
     let mut selected_chat_ids: Vec<String> = chat_ids.clone();
@@ -762,7 +1146,7 @@ fn export_selected_archive(
     selected_chat_ids.dedup();
 
     if selected_chat_ids.is_empty() {
-      return Err("No selected projects or chats to export".to_string());
+        return Err("No selected projects or chats to export".to_string());
     }
 
     let mut exported = 0usize;
@@ -785,7 +1169,6 @@ fn export_selected_archive(
 
         let should_skip = match mode.as_str() {
             "force" => false,
-            "repair_assets" => exported_fp.is_some(),
             _ => exported_fp.as_deref() == Some(live_fp.as_str()),
         };
 
@@ -804,7 +1187,10 @@ fn export_selected_archive(
     }
 
     build_archive_index_html(&conn, &root_dir)?;
-    Ok(format!("Exported {} chat(s), skipped {}, and regenerated index.html", exported, skipped))
+    Ok(format!(
+        "Exported {} chat(s), skipped {}, and regenerated index.html",
+        exported, skipped
+    ))
 }
 
 fn visit_json_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -841,9 +1227,19 @@ fn list_json_files(folder_path: &str) -> Result<Vec<PathBuf>, String> {
 }
 
 #[tauri::command]
-fn auto_import_capture_folder(state: tauri::State<AppState>, folder_path: String) -> Result<String, String> {
+fn auto_import_capture_folder(
+    state: tauri::State<AppState>,
+    folder_path: String,
+) -> Result<String, String> {
+    if folder_path.trim().is_empty() {
+        return Err("No watched folder configured".to_string());
+    }
+
     let files = list_json_files(&folder_path)?;
-    let mut conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let mut conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
     ensure_default_workspace(&conn).map_err(|e| e.to_string())?;
 
@@ -852,7 +1248,11 @@ fn auto_import_capture_folder(state: tauri::State<AppState>, folder_path: String
     let mut failed = 0usize;
 
     for path in files {
-        let canonical = path.canonicalize().unwrap_or(path.clone()).to_string_lossy().to_string();
+        let canonical = path
+            .canonicalize()
+            .unwrap_or(path.clone())
+            .to_string_lossy()
+            .to_string();
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(_) => {
@@ -882,20 +1282,25 @@ fn auto_import_capture_folder(state: tauri::State<AppState>, folder_path: String
             }
         };
 
+        let workspace_id = bundle.workspace.id.clone();
+        let workspace_name = bundle
+            .workspace
+            .name
+            .clone()
+            .unwrap_or("Default Workspace".to_string());
+
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+
         tx.execute(
             "INSERT OR REPLACE INTO workspaces (id, name) VALUES (?1, ?2)",
-            params![
-                bundle.workspace.id,
-                bundle.workspace.name.unwrap_or("Default Workspace".to_string())
-            ],
+            params![workspace_id, workspace_name],
         )
         .map_err(|e| e.to_string())?;
 
         for p in bundle.projects {
             tx.execute(
                 "INSERT OR REPLACE INTO projects (id, workspace_id, name) VALUES (?1, ?2, ?3)",
-                params![p.id, "default", p.name],
+                params![p.id, workspace_id, p.name],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -903,17 +1308,20 @@ fn auto_import_capture_folder(state: tauri::State<AppState>, folder_path: String
         for c in bundle.chats {
             tx.execute(
                 "INSERT OR REPLACE INTO chats (id, workspace_id, project_id, title, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![c.id, "default", c.project_id, c.title, c.fingerprint, c.updated_at],
+                params![c.id, workspace_id, c.project_id, c.title, c.fingerprint, c.updated_at],
             )
             .map_err(|e| e.to_string())?;
         }
 
+        let mut message_index_by_chat: HashMap<String, i64> = HashMap::new();
         for m in bundle.messages {
+            let sort_index = message_index_by_chat.entry(m.chat_id.clone()).or_insert(0);
             tx.execute(
-                "INSERT OR REPLACE INTO messages (id, chat_id, role, body) VALUES (?1, ?2, ?3, ?4)",
-                params![m.id, m.chat_id, m.role, m.raw_html.unwrap_or_default()],
+                "INSERT OR REPLACE INTO messages (id, chat_id, role, body, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, CURRENT_TIMESTAMP))",
+                params![m.id, m.chat_id, m.role, m.raw_html.unwrap_or_default(), *sort_index, m.created_at],
             )
             .map_err(|e| e.to_string())?;
+            *sort_index += 1;
         }
 
         for a in bundle.assets {
@@ -947,7 +1355,10 @@ fn queue_export_job(
     mode: String,
     root_dir: String,
 ) -> Result<String, String> {
-    let conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO export_jobs (target, mode, root_dir, status) VALUES (?1, ?2, ?3, 'queued')",
@@ -959,7 +1370,10 @@ fn queue_export_job(
 
 #[tauri::command]
 fn run_pending_export_jobs(state: tauri::State<AppState>) -> Result<String, String> {
-    let conn = state.conn.lock().map_err(|_| "db lock failed".to_string())?;
+    let conn = state
+        .conn
+        .lock()
+        .map_err(|_| "db lock failed".to_string())?;
     let mut stmt = conn
         .prepare("SELECT id, mode, root_dir FROM export_jobs WHERE status IN ('queued', 'failed') ORDER BY id")
         .map_err(|e| e.to_string())?;
@@ -1001,7 +1415,6 @@ fn run_pending_export_jobs(state: tauri::State<AppState>) -> Result<String, Stri
 
             let should_skip = match mode.as_str() {
                 "force" => false,
-                "repair_assets" => exported_fp.is_some(),
                 _ => exported_fp.as_deref() == Some(live_fp.as_str()),
             };
             if should_skip {
@@ -1041,14 +1454,23 @@ fn run_pending_export_jobs(state: tauri::State<AppState>) -> Result<String, Stri
 }
 
 fn main() {
-    let conn = Connection::open("project_archivist.db").expect("open sqlite db");
-    init_schema(&conn).expect("init schema");
-    ensure_default_workspace(&conn).expect("default workspace");
-
     tauri::Builder::default()
-        .manage(AppState {
-            conn: Mutex::new(conn),
+        .setup(|app| {
+            let mut db_dir = app.path().app_data_dir()?;
+            fs::create_dir_all(&db_dir)?;
+            db_dir.push("project_archivist.db");
+
+            let conn = Connection::open(&db_dir)?;
+            init_schema(&conn)?;
+            ensure_default_workspace(&conn)?;
+
+            app.manage(AppState {
+                conn: Mutex::new(conn),
+            });
+
+            Ok(())
         })
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             diagnostics_health,
             diagnostics_report,
