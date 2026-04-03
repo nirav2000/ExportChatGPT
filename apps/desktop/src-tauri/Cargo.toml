@@ -9,11 +9,13 @@ tauri-build = { version = "2.0.1", features = [] }
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2.2.5", features = ["macos-private-api"] }
+tauri = { version = "2.2.5", features = [] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 zip = "2.2.2"
 sha2 = "0.10.8"
 hex = "0.4.3"
+base64 = "0.22.1"
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls"] }
 
 [features]
 default = ["custom-protocol"]

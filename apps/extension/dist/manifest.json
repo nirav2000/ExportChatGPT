@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Project Archivist",
+  "version": "0.1.0",
+  "description": "Local-first ChatGPT capture and export helper",
+  "action": { "default_title": "Project Archivist", "default_popup": "popup.html" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "permissions": ["storage", "downloads", "sidePanel", "tabs", "scripting"],
+  "optional_host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+  "background": { "service_worker": "src/service-worker.js", "type": "module" },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["src/content-script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
