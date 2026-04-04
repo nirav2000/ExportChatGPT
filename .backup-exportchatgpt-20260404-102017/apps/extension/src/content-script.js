@@ -5,6 +5,8 @@ function inferRole(node) {
   const roleHost = node.closest('[data-message-author-role]');
   if (roleHost) return roleHost.getAttribute('data-message-author-role') || 'unknown';
 
+  const txt = node.textContent?.toLowerCase() || '';
+  if (txt.includes('you said')) return 'assistant';
   return 'unknown';
 }
 
@@ -147,14 +149,14 @@ function getVisibleProjectAnchors() {
         const name = (titleNode?.getAttribute('title') || textFromNode(titleNode) || '').trim();
         const href = normalizeHref(anchor.getAttribute('href') || '');
 
-        if (!name || !href) return null;
-
-        return {
-          anchor,
-          id: projectIdFromHref(href, name),
-          name,
-          href,
-        };
+        return name
+          ? {
+              anchor,
+              id: projectIdFromHref(href, name),
+              name,
+              href,
+            }
+          : null;
       })
       .filter(Boolean),
     (project) => project.href || project.id || project.name,
@@ -266,12 +268,12 @@ function getLoadedProjectPageName() {
   const h1 = document.querySelector('main h1');
   if (h1 && textFromNode(h1)) return textFromNode(h1);
 
-  const currentProjectId = getCurrentProjectIdFromUrl();
-  const sidebarProject = getVisibleProjectAnchors().find((project) =>
-    currentProjectId && project.href.includes(`/g/${currentProjectId}/project`),
-  );
+  const activeSidebarProject = getVisibleProjectAnchors().find((project) => {
+    const currentProjectId = getCurrentProjectIdFromUrl();
+    return currentProjectId && project.href.includes(`/g/${currentProjectId}/project`);
+  });
 
-  return sidebarProject?.name || null;
+  return activeSidebarProject?.name || null;
 }
 
 function getLoadedProjectPagePanel() {
@@ -306,8 +308,6 @@ function getLoadedProjectPageChatsOnce(projectId, projectName) {
 
 async function forceLoadAllProjectPageChats(projectId, projectName) {
   const panel = getLoadedProjectPagePanel();
-  if (!panel) return [];
-
   const scrollRoot = document.querySelector('[data-scroll-root]');
   const scrollers = [panel, findScrollableAncestor(panel), scrollRoot, document.scrollingElement || document.documentElement]
     .filter(Boolean);
@@ -325,15 +325,15 @@ async function forceLoadAllProjectPageChats(projectId, projectName) {
       lastCount = count;
     }
 
-    const anchors = Array.from(panel.querySelectorAll('a[href*="/c/"]'));
-    const lastAnchor = anchors[anchors.length - 1];
+    const lastAnchor = panel?.querySelector('li:last-child a[href*="/c/"]');
     if (lastAnchor) {
       lastAnchor.scrollIntoView({ block: 'nearest' });
     } else {
-      panel.scrollIntoView({ block: 'nearest' });
+      panel?.scrollIntoView({ block: 'nearest' });
     }
 
     for (const scroller of scrollers) {
+      if (!scroller) continue;
       scroller.scrollTop = scroller.scrollHeight;
       scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
     }
@@ -386,7 +386,9 @@ function getExpandedProjectLiForCurrentChat() {
   if (!section) return null;
 
   return Array.from(section.querySelectorAll('ul > li')).find((li) => {
-    return Boolean(li.querySelector(`a[href*="/c/${currentChatId}"]`));
+    const hasCurrentChat = Boolean(li.querySelector(`a[href*="/c/${currentChatId}"]`));
+    const hasActiveProject = Boolean(li.querySelector(`a[href*="/g/g-p-"][href$="/project"][data-active]`));
+    return hasCurrentChat || hasActiveProject;
   }) || null;
 }
 
@@ -456,26 +458,44 @@ async function scanCurrentProjectNav() {
 
 function scanStandaloneChatsNav() {
   const warnings = [];
-  const nav = document.querySelector('nav[aria-label="Chat history"]');
-  const projectsSection = getProjectsSection();
-  const allChatAnchors = Array.from((nav || document).querySelectorAll('a[href*="/c/"]'));
+  const projectAnchors = getVisibleProjectAnchors();
+  const projectChatHrefSet = new Set();
+
+  const expandedProjectLis = Array.from((getProjectsSection() || document).querySelectorAll('ul > li'));
+  for (const li of expandedProjectLis) {
+    for (const a of li.querySelectorAll('a[href*="/c/"]')) {
+      projectChatHrefSet.add(normalizeHref(a.getAttribute('href') || ''));
+    }
+  }
+
+  const allAnchors = uniqueBy(
+    Array.from(document.querySelectorAll('a[href*="/c/"]')),
+    (a) => normalizeHref(a.getAttribute('href') || ''),
+  );
+
+  const standaloneAnchors = allAnchors.filter((a) => {
+    const href = normalizeHref(a.getAttribute('href') || '');
+    if (!href.includes('/c/')) return false;
+    if (projectChatHrefSet.has(href)) return false;
+    const text = textFromNode(a.querySelector('div.truncate') || a);
+    return Boolean(text);
+  });
 
   const chats = uniqueBy(
-    allChatAnchors
-      .filter((a) => !projectsSection || !projectsSection.contains(a))
-      .map((a) => {
-        const title = textFromNode(a.querySelector('div.truncate') || a) || 'Untitled Chat';
-        return {
-          id: chatIdFromHref(a.getAttribute('href') || '', title),
-          title,
-          href: normalizeHref(a.getAttribute('href') || ''),
-          projectId: null,
-          projectName: null,
-        };
-      }),
+    standaloneAnchors.map((a) => {
+      const title = textFromNode(a.querySelector('div.truncate') || a) || 'Untitled Chat';
+      return {
+        id: chatIdFromHref(a.getAttribute('href') || '', title),
+        title,
+        href: normalizeHref(a.getAttribute('href') || ''),
+        projectId: null,
+        projectName: null,
+      };
+    }),
     (chat) => chat.id,
   );
 
+  if (!projectAnchors.length) warnings.push('Projects section not found while scanning standalone chats');
   if (!chats.length) warnings.push('No standalone chats found outside the Projects section');
 
   return {

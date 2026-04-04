@@ -13,6 +13,10 @@ const STORAGE_KEYS = {
 
 const LEGACY_STORAGE_KEYS = ['cachedChatBundles', 'lastCapture'];
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function cleanupLegacyStorage() {
   await chrome.storage.local.remove(LEGACY_STORAGE_KEYS);
 }
@@ -57,7 +61,7 @@ async function resolveAssetBytes(asset) {
     let urlObj = null;
     try {
       urlObj = new URL(asset.originalUrl);
-    } catch (_e) {}
+    } catch {}
 
     const isAllowedOrigin =
       !urlObj ||
@@ -69,14 +73,13 @@ async function resolveAssetBytes(asset) {
       return { ...asset, resolveStatus: 'skipped-third-party-origin' };
     }
 
-    let credentials = 'omit';
-    if (urlObj) {
-      const isChatGPTOrigin =
-        urlObj.origin === 'https://chatgpt.com' ||
+    const credentials =
+      urlObj &&
+      (urlObj.origin === 'https://chatgpt.com' ||
         urlObj.origin === 'https://chat.openai.com' ||
-        urlObj.origin.endsWith('.openai.com');
-      credentials = isChatGPTOrigin ? 'include' : 'omit';
-    }
+        urlObj.origin.endsWith('.openai.com'))
+        ? 'include'
+        : 'omit';
 
     const response = await fetch(asset.originalUrl, { credentials });
     if (!response.ok) return { ...asset, resolveStatus: `http-${response.status}` };
@@ -103,18 +106,51 @@ async function getActiveTab() {
   return tab;
 }
 
+async function getTab(tabId) {
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch {
+    return null;
+  }
+}
+
+async function waitFor(predicate, timeoutMs = 15000, intervalMs = 250) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const ok = await predicate();
+    if (ok) return true;
+    await sleep(intervalMs);
+  }
+  return false;
+}
+
+async function waitForTabComplete(tabId, timeoutMs = 20000) {
+  return waitFor(async () => {
+    const tab = await getTab(tabId);
+    return Boolean(tab && tab.status === 'complete');
+  }, timeoutMs, 250);
+}
+
+async function waitForTabUrlContains(tabId, needle, timeoutMs = 15000) {
+  if (!needle) return true;
+  return waitFor(async () => {
+    const tab = await getTab(tabId);
+    return Boolean(tab?.url && tab.url.includes(needle));
+  }, timeoutMs, 250);
+}
+
 async function ensureContentScript(tabId) {
   try {
     const pong = await chrome.tabs.sendMessage(tabId, { type: 'ping' });
     if (pong?.ok) return;
-  } catch (_error) {}
+  } catch {}
 
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ['src/content-script.js'],
   });
 
-  await new Promise((r) => setTimeout(r, 400));
+  await sleep(400);
 }
 
 function sanitizeId(input) {
@@ -156,6 +192,7 @@ function buildProjectsFromChats(chats) {
       ungroupedChats.push({ ...chat, projectId: null, projectName: null });
       continue;
     }
+
     if (!projectMap.has(chat.projectId)) {
       projectMap.set(chat.projectId, {
         id: chat.projectId,
@@ -163,6 +200,7 @@ function buildProjectsFromChats(chats) {
         chats: [],
       });
     }
+
     projectMap.get(chat.projectId).chats.push({
       id: chat.id,
       title: chat.title,
@@ -269,12 +307,22 @@ function mergeProjectScans(existingScan, newScan) {
 
   return {
     detectedAt: newScan.detectedAt || new Date().toISOString(),
-    mode: 'current-project',
+    mode: newScan.mode || 'current-project',
     warnings: Array.from(new Set([...(existingScan.warnings || []), ...(newScan.warnings || [])])),
     chats,
     ungroupedChats,
     projects,
   };
+}
+
+async function navigateAndSettle(tabId, url, expectedSubstring = '') {
+  await chrome.tabs.update(tabId, { url });
+  if (expectedSubstring) {
+    await waitForTabUrlContains(tabId, expectedSubstring, 15000);
+  }
+  await waitForTabComplete(tabId, 20000);
+  await sleep(1800);
+  await ensureContentScript(tabId);
 }
 
 async function captureFromTab(tabId, discovered = null) {
@@ -325,8 +373,7 @@ async function captureFromTab(tabId, discovered = null) {
 async function captureWithRetry(tabId, chat, extraDelayMs = 9000) {
   let bundle = await captureFromTab(tabId, chat);
   if ((bundle.messages?.length || 0) > 0) return bundle;
-
-  await new Promise((r) => setTimeout(r, extraDelayMs));
+  await sleep(extraDelayMs);
   bundle = await captureFromTab(tabId, chat);
   return bundle;
 }
@@ -349,15 +396,77 @@ async function downloadJsonObject(obj, filename) {
 
 async function exportBundleForChat(bundle, chat) {
   const folderRoot = chat.projectName
-    ? `projects/${sanitizeFilePart(chat.projectName)}`
-    : 'ungrouped';
+    ? `project-archivist-export/projects/${sanitizeFilePart(chat.projectName)}`
+    : 'project-archivist-export/ungrouped';
 
   const filename = `${sanitizeFilePart(chat.id)} - ${sanitizeFilePart(chat.title)}.json`;
 
-  await downloadJsonObject(
-    bundle,
-    `project-archivist-export/${folderRoot}/${filename}`,
-  );
+  await downloadJsonObject(bundle, `${folderRoot}/${filename}`);
+}
+
+async function captureAndExportChats(tabId, chats, capturedChatMeta, exportedChatIds, progress) {
+  const toCapture = chats.filter((chat) => !alreadyCaptured(chat, capturedChatMeta, exportedChatIds));
+  progress.total += toCapture.length;
+
+  if (!toCapture.length) {
+    progress.logs.unshift('No new chats to capture/export in this scope.');
+    progress.logs = progress.logs.slice(0, 80);
+    await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
+    return;
+  }
+
+  for (let i = 0; i < toCapture.length; i++) {
+    const chat = toCapture[i];
+    const label = `${chat.projectName || 'Standalone'} / ${chat.title}`;
+
+    progress.current = label;
+    progress.logs.unshift(`Scanning ${i + 1}/${toCapture.length}: ${label}`);
+    progress.logs = progress.logs.slice(0, 80);
+    await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
+
+    try {
+      const href = chat.href || '';
+      const match = href.match(/\/c\/([^/?#]+)/);
+      const expectedChatId = match?.[1] ? `/c/${match[1]}` : '/c/';
+
+      await navigateAndSettle(tabId, href, expectedChatId);
+
+      let bundle = await captureFromTab(tabId, chat);
+      if ((bundle.messages?.length || 0) === 0) {
+        progress.logs.unshift(`Retrying zero-message page with longer wait: ${label}`);
+        progress.logs = progress.logs.slice(0, 80);
+        await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
+        bundle = await captureWithRetry(tabId, chat, 9000);
+      }
+
+      await exportBundleForChat(bundle, chat);
+
+      const messageCount = bundle.messages?.length || 0;
+      const assetCount = bundle.assets?.length || 0;
+
+      capturedChatMeta[chat.id] = {
+        messageCount,
+        assetCount,
+        capturedAt: new Date().toISOString(),
+        changed: true,
+      };
+
+      if (!exportedChatIds.includes(chat.id)) exportedChatIds.push(chat.id);
+
+      progress.completed += 1;
+      progress.logs.unshift(`✅ ${label} [${messageCount} msgs]`);
+    } catch (error) {
+      progress.failed += 1;
+      progress.logs.unshift(`❌ ${label}: ${error.message || String(error)}`);
+    }
+
+    progress.logs = progress.logs.slice(0, 80);
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.progress]: progress,
+      [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
+      [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
+    });
+  }
 }
 
 async function runScopedScan(rawMessageType, phaseLabel) {
@@ -372,32 +481,21 @@ async function runScopedScan(rawMessageType, phaseLabel) {
     const prepared = applyManualGroupsToScan(rawScan, stored.manualGroups);
     const combinedScan = mergeProjectScans(stored.currentProjectScan, prepared);
 
-    const scopedChats =
-      rawMessageType === 'scan-current-project-nav'
-        ? [...(prepared.chats || [])]
-        : [...(prepared.ungroupedChats || [])];
-
     const selectedProjectIds =
-      rawMessageType === 'scan-current-project-nav' && prepared.projects?.length
-        ? [prepared.projects[0].id]
+      rawMessageType === 'scan-current-project-nav' || rawMessageType === 'scan-loaded-project-page-nav'
+        ? (prepared.projects || []).map((p) => p.id)
         : [];
 
     const capturedChatMeta = { ...(stored.capturedChatMeta || {}) };
     const exportedChatIds = [...(stored.exportedChatIds || [])];
 
-    const chatsToCapture = scopedChats.filter((chat) => !alreadyCaptured(chat, capturedChatMeta, exportedChatIds));
-
     const progress = {
       phase: phaseLabel,
-      total: chatsToCapture.length,
+      total: 0,
       completed: 0,
       failed: 0,
       current: '',
-      logs: [
-        `Chats found in this scan: ${scopedChats.length}`,
-        `Already captured/exported: ${scopedChats.length - chatsToCapture.length}`,
-        `To capture now: ${chatsToCapture.length}`,
-      ],
+      logs: [...(prepared.warnings || [])],
     };
 
     await chrome.storage.local.set({
@@ -405,82 +503,21 @@ async function runScopedScan(rawMessageType, phaseLabel) {
       [STORAGE_KEYS.progress]: progress,
       [STORAGE_KEYS.currentProjectScan]: combinedScan,
       [STORAGE_KEYS.selectedProjectIds]: selectedProjectIds,
-      [STORAGE_KEYS.selectedChatIds]: chatsToCapture.map((c) => c.id),
+      [STORAGE_KEYS.selectedChatIds]: [],
     });
 
-    if (!chatsToCapture.length) {
+    const chats = [...(prepared.chats || []), ...(prepared.ungroupedChats || [])];
+    if (!chats.length) {
+      progress.logs.unshift('No chats found in this scan.');
       await chrome.storage.local.set({
-        [STORAGE_KEYS.currentProjectScan]: combinedScan,
-        [STORAGE_KEYS.captureState]: 'complete',
-        [STORAGE_KEYS.progress]: {
-          ...progress,
-          phase: `${phaseLabel}-complete`,
-          current: '',
-          logs: [...progress.logs, 'All chats in this scan were already captured.'],
-        },
-        [STORAGE_KEYS.selectedProjectIds]: selectedProjectIds,
-        [STORAGE_KEYS.selectedChatIds]: scopedChats
-          .filter((c) => !stored.exportedChatIds.includes(c.id))
-          .map((c) => c.id),
-        [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
-        [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
-      });
-
-      return { ok: true, scan: combinedScan, skippedAlreadyScanned: true };
-    }
-
-    for (let i = 0; i < chatsToCapture.length; i++) {
-      const chat = chatsToCapture[i];
-      const label = `${chat.projectName || 'Standalone'} / ${chat.title}`;
-      progress.current = label;
-      progress.logs.unshift(`Scanning ${i + 1}/${chatsToCapture.length}: ${label}`);
-      progress.logs = progress.logs.slice(0, 60);
-      await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
-
-      try {
-        await chrome.tabs.update(tab.id, { url: chat.href });
-        await new Promise((r) => setTimeout(r, 4500));
-        await ensureContentScript(tab.id);
-
-        let bundle = await captureFromTab(tab.id, chat);
-        if ((bundle.messages?.length || 0) === 0) {
-          progress.logs.unshift(`Retrying zero-message page with longer wait: ${label}`);
-          progress.logs = progress.logs.slice(0, 60);
-          await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
-          bundle = await captureWithRetry(tab.id, chat, 9000);
-        }
-
-        await exportBundleForChat(bundle, chat);
-
-        const messageCount = bundle.messages?.length || 0;
-        const assetCount = bundle.assets?.length || 0;
-
-        capturedChatMeta[chat.id] = {
-          messageCount,
-          assetCount,
-          capturedAt: new Date().toISOString(),
-          changed: true,
-        };
-        if (!exportedChatIds.includes(chat.id)) exportedChatIds.push(chat.id);
-
-        progress.completed += 1;
-        progress.logs.unshift(`✅ ${label} [${messageCount} msgs]`);
-      } catch (error) {
-        progress.failed += 1;
-        progress.logs.unshift(`❌ ${label}: ${error.message || String(error)}`);
-      }
-
-      progress.logs = progress.logs.slice(0, 60);
-      await chrome.storage.local.set({
+        [STORAGE_KEYS.captureState]: 'failed',
         [STORAGE_KEYS.progress]: progress,
-        [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
-        [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
+        [STORAGE_KEYS.currentProjectScan]: combinedScan,
       });
+      return { ok: false, error: 'No chats found in this scan.' };
     }
 
-    const selectedChatIds = scopedChats
-      .filter((c) => !exportedChatIds.includes(c.id))
-      .map((c) => c.id);
+    await captureAndExportChats(tab.id, chats, capturedChatMeta, exportedChatIds, progress);
 
     await chrome.storage.local.set({
       [STORAGE_KEYS.currentProjectScan]: combinedScan,
@@ -491,9 +528,17 @@ async function runScopedScan(rawMessageType, phaseLabel) {
         current: '',
       },
       [STORAGE_KEYS.selectedProjectIds]: selectedProjectIds,
-      [STORAGE_KEYS.selectedChatIds]: selectedChatIds,
+      [STORAGE_KEYS.selectedChatIds]: [],
       [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
       [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
+      [STORAGE_KEYS.lastWorkspaceExport]: {
+        exportedAt: new Date().toISOString(),
+        total: progress.total,
+        completed: progress.completed,
+        failed: progress.failed,
+        failedChats: [],
+        mode: phaseLabel,
+      },
     });
 
     return { ok: true, scan: combinedScan };
@@ -504,11 +549,139 @@ async function runScopedScan(rawMessageType, phaseLabel) {
 }
 
 async function scanCurrentProject() {
-  return runScopedScan('scan-current-project-nav', 'scan-current-project');
+  const tab = await getActiveTab();
+  const messageType = /\/project(?:[/?#]|$)/.test(tab?.url || '')
+    ? 'scan-loaded-project-page-nav'
+    : 'scan-current-project-nav';
+  return runScopedScan(messageType, 'scan-current-project');
 }
 
 async function scanStandaloneChats() {
   return runScopedScan('scan-standalone-nav', 'scan-standalone-chats');
+}
+
+async function scanAllProjects() {
+  try {
+    const tab = await getActiveTab();
+    if (!tab?.id) return { ok: false, error: 'No active tab found' };
+
+    await ensureContentScript(tab.id);
+    const discovery = await chrome.tabs.sendMessage(tab.id, { type: 'discover-all-projects-nav' });
+
+    const discoveredProjects = (discovery?.projects || []).filter(
+      (project) => project?.href && project?.name && project.name !== 'New project' && project.name !== 'More',
+    );
+
+    if (!discoveredProjects.length) {
+      return { ok: false, error: 'No projects found to scan.' };
+    }
+
+    const stored = await getStoredState();
+    let combinedScan = stored.currentProjectScan || {
+      detectedAt: new Date().toISOString(),
+      mode: 'all-projects',
+      warnings: discovery?.warnings || [],
+      projects: [],
+      chats: [],
+      ungroupedChats: [],
+    };
+
+    const capturedChatMeta = { ...(stored.capturedChatMeta || {}) };
+    const exportedChatIds = [...(stored.exportedChatIds || [])];
+
+    const progress = {
+      phase: 'scan-all-projects',
+      total: 0,
+      completed: 0,
+      failed: 0,
+      current: '',
+      logs: [`Discovered ${discoveredProjects.length} project(s)`],
+    };
+
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.captureState]: 'capturing',
+      [STORAGE_KEYS.progress]: progress,
+      [STORAGE_KEYS.currentProjectScan]: combinedScan,
+      [STORAGE_KEYS.selectedProjectIds]: [],
+      [STORAGE_KEYS.selectedChatIds]: [],
+    });
+
+    for (let i = 0; i < discoveredProjects.length; i++) {
+      const project = discoveredProjects[i];
+      progress.current = `Project ${i + 1}/${discoveredProjects.length}: ${project.name}`;
+      progress.logs.unshift(`Opening project ${i + 1}/${discoveredProjects.length}: ${project.name}`);
+      progress.logs = progress.logs.slice(0, 80);
+      await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
+
+      try {
+        await navigateAndSettle(tab.id, project.href, '/project');
+
+        const rawProjectScan = await chrome.tabs.sendMessage(tab.id, {
+          type: 'scan-loaded-project-page-nav',
+        });
+
+        const prepared = applyManualGroupsToScan(rawProjectScan, stored.manualGroups);
+        combinedScan = mergeProjectScans(combinedScan, prepared);
+
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.currentProjectScan]: combinedScan,
+        });
+
+        const chats = [...(prepared.chats || [])];
+        if (!chats.length) {
+          progress.logs.unshift(`⚠ ${project.name}: no chats found on loaded project page`);
+          progress.logs = progress.logs.slice(0, 80);
+          await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
+          continue;
+        }
+
+        await captureAndExportChats(tab.id, chats, capturedChatMeta, exportedChatIds, progress);
+
+        progress.logs.unshift(`✅ Project complete: ${project.name}`);
+        progress.logs = progress.logs.slice(0, 80);
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.progress]: progress,
+          [STORAGE_KEYS.currentProjectScan]: combinedScan,
+          [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
+          [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
+        });
+      } catch (error) {
+        progress.failed += 1;
+        progress.logs.unshift(`❌ ${project.name}: ${error.message || String(error)}`);
+        progress.logs = progress.logs.slice(0, 80);
+        await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
+      }
+    }
+
+    const selectedProjectIds = (combinedScan.projects || []).map((project) => project.id);
+
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.currentProjectScan]: combinedScan,
+      [STORAGE_KEYS.captureState]: progress.failed ? 'partial' : 'complete',
+      [STORAGE_KEYS.progress]: {
+        ...progress,
+        phase: 'scan-all-projects-complete',
+        current: '',
+      },
+      [STORAGE_KEYS.selectedProjectIds]: selectedProjectIds,
+      [STORAGE_KEYS.selectedChatIds]: [],
+      [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
+      [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
+      [STORAGE_KEYS.lastWorkspaceExport]: {
+        exportedAt: new Date().toISOString(),
+        total: progress.total,
+        completed: progress.completed,
+        failed: progress.failed,
+        failedChats: [],
+        mode: 'scan-all-projects',
+      },
+    });
+
+    return { ok: true, scan: combinedScan };
+  } catch (error) {
+    await chrome.storage.local.set({ [STORAGE_KEYS.captureState]: 'failed' });
+    return { ok: false, error: error.message || String(error) };
+  }
 }
 
 async function setManualGroup(selectedChatIds, projectName, overwriteExisting) {
@@ -571,9 +744,7 @@ async function clearManualGroup(selectedChatIds) {
 async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false) {
   const stored = await getStoredState();
   const currentProjectScan = stored.currentProjectScan;
-  const projectChats = currentProjectScan?.chats || [];
-  const ungroupedChats = currentProjectScan?.ungroupedChats || [];
-  const allChats = [...projectChats, ...ungroupedChats];
+  const allChats = [...(currentProjectScan?.chats || []), ...(currentProjectScan?.ungroupedChats || [])];
 
   if (!allChats.length) {
     return { ok: false, error: 'No scanned chats available. Use a scan button first.' };
@@ -585,6 +756,9 @@ async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false
     return { ok: false, error: 'No selected chats available for export.' };
   }
 
+  const tab = await getActiveTab();
+  if (!tab?.id) return { ok: false, error: 'No active tab found' };
+
   const progress = {
     phase: recaptureOnly ? 'recapture-selected-chats' : 'selected-chat-export',
     total: chats.length,
@@ -594,34 +768,33 @@ async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false
     logs: [],
   };
 
-  await chrome.storage.local.set({ [STORAGE_KEYS.captureState]: 'capturing', [STORAGE_KEYS.progress]: progress });
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.captureState]: 'capturing',
+    [STORAGE_KEYS.progress]: progress,
+  });
 
-  const failedChats = [];
-  const exportedChatIds = new Set(stored.exportedChatIds || []);
-  const remainingSelected = new Set(stored.selectedChatIds || []);
+  const exportedChatIds = [...(stored.exportedChatIds || [])];
   const capturedChatMeta = { ...(stored.capturedChatMeta || {}) };
 
   for (let i = 0; i < chats.length; i++) {
     const chat = chats[i];
     const label = `${chat.projectName || 'Standalone'} / ${chat.title}`;
+
     progress.current = label;
     progress.logs.unshift(`${recaptureOnly ? 'Re-capturing' : 'Exporting'} ${i + 1}/${chats.length}: ${label}`);
-    progress.logs = progress.logs.slice(0, 60);
+    progress.logs = progress.logs.slice(0, 80);
     await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
 
     try {
-      const sourceTab = await getActiveTab();
-      if (!sourceTab?.id) throw new Error('No active tab found');
-      await chrome.tabs.update(sourceTab.id, { url: chat.href });
-      await new Promise((r) => setTimeout(r, 4500));
-      await ensureContentScript(sourceTab.id);
+      const href = chat.href || '';
+      const match = href.match(/\/c\/([^/?#]+)/);
+      const expectedChatId = match?.[1] ? `/c/${match[1]}` : '/c/';
 
-      let bundle = await captureFromTab(sourceTab.id, chat);
+      await navigateAndSettle(tab.id, href, expectedChatId);
+
+      let bundle = await captureFromTab(tab.id, chat);
       if ((bundle.messages?.length || 0) === 0) {
-        progress.logs.unshift(`Retrying zero-message page with longer wait: ${label}`);
-        progress.logs = progress.logs.slice(0, 60);
-        await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
-        bundle = await captureWithRetry(sourceTab.id, chat, 9000);
+        bundle = await captureWithRetry(tab.id, chat, 9000);
       }
 
       const messageCount = bundle.messages?.length || 0;
@@ -636,106 +809,62 @@ async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false
 
       if (!recaptureOnly) {
         await exportBundleForChat(bundle, chat);
-        exportedChatIds.add(chat.id);
-        remainingSelected.delete(chat.id);
+        if (!exportedChatIds.includes(chat.id)) exportedChatIds.push(chat.id);
       }
 
       progress.completed += 1;
       progress.logs.unshift(`✅ ${label} [${messageCount} msgs]`);
     } catch (error) {
       progress.failed += 1;
-      failedChats.push({
-        title: chat.title,
-        projectName: chat.projectName,
-        href: chat.href,
-        error: error.message || String(error),
-      });
       progress.logs.unshift(`❌ ${label}: ${error.message || String(error)}`);
     }
 
-    progress.logs = progress.logs.slice(0, 60);
+    progress.logs = progress.logs.slice(0, 80);
     await chrome.storage.local.set({
       [STORAGE_KEYS.progress]: progress,
-      [STORAGE_KEYS.exportedChatIds]: Array.from(exportedChatIds),
-      [STORAGE_KEYS.selectedChatIds]: Array.from(remainingSelected),
+      [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
       [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
     });
   }
 
   await chrome.storage.local.set({
-    [STORAGE_KEYS.captureState]: failedChats.length ? 'partial' : 'complete',
-    [STORAGE_KEYS.lastWorkspaceExport]: {
-      exportedAt: new Date().toISOString(),
-      total: chats.length,
-      completed: progress.completed,
-      failed: progress.failed,
-      failedChats,
-      mode: recaptureOnly ? 'recapture-selected-chats' : 'selected-chats',
-    },
+    [STORAGE_KEYS.captureState]: progress.failed ? 'partial' : 'complete',
     [STORAGE_KEYS.progress]: {
       ...progress,
       phase: 'export-complete',
       current: '',
     },
-  });
-
-  return {
-    ok: true,
-    summary: {
-      total: chats.length,
+    [STORAGE_KEYS.lastWorkspaceExport]: {
+      exportedAt: new Date().toISOString(),
+      total: progress.total,
       completed: progress.completed,
       failed: progress.failed,
-      failedChats,
-      recaptureOnly,
+      failedChats: [],
+      mode: recaptureOnly ? 'recapture-selected-chats' : 'selected-chat-export',
     },
-  };
+  });
+
+  return { ok: true };
 }
 
 async function exportSelectedGroups(selectedProjectIds = []) {
   const stored = await getStoredState();
-  const currentProjectScan = stored.currentProjectScan;
-  const projects = currentProjectScan?.projects || [];
+  const projects = stored.currentProjectScan?.projects || [];
   const selectedProjects = projects.filter((p) => selectedProjectIds.includes(p.id));
 
   if (!selectedProjects.length) {
     return { ok: false, error: 'No selected groups available for export.' };
   }
 
-  let total = 0;
-  let completed = 0;
-  let failed = 0;
-  const failedChats = [];
-
-  for (const project of selectedProjects) {
-    const chatIds = (project.chats || []).map((c) => c.id);
-    total += chatIds.length;
-    const res = await exportSelectedChats(chatIds, false);
-    if (!res.ok) {
-      failed += chatIds.length;
-      failedChats.push({ title: project.name, projectName: project.name, error: res.error || 'Unknown error' });
-      continue;
-    }
-    completed += res.summary?.completed || 0;
-    failed += res.summary?.failed || 0;
-    failedChats.push(...(res.summary?.failedChats || []));
-  }
-
-  return {
-    ok: true,
-    summary: {
-      total,
-      completed,
-      failed,
-      failedChats,
-      mode: 'selected-groups',
-    },
-  };
+  const chatIds = selectedProjects.flatMap((project) => (project.chats || []).map((chat) => chat.id));
+  return exportSelectedChats(chatIds, false);
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   (async () => {
     if (message.type === 'scan-current-project') return sendResponse(await scanCurrentProject());
     if (message.type === 'scan-standalone-chats') return sendResponse(await scanStandaloneChats());
+    if (message.type === 'scan-all-projects') return sendResponse(await scanAllProjects());
 
     if (message.type === 'export-selected-groups') {
       return sendResponse(await exportSelectedGroups(message.selectedProjectIds || []));

@@ -381,6 +381,23 @@ async function doScanProject() {
   }
 }
 
+async function doScanAllProjects() {
+  setState('scanning');
+  resultEl.textContent = 'Scanning all projects...';
+  startPolling();
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'scan-all-projects' });
+    if (!response?.ok) {
+      setState('failed');
+      resultEl.textContent = `All-project scan failed: ${response?.error || 'Unknown error'}`;
+      return;
+    }
+    await refreshUi();
+  } finally {
+    stopPolling();
+  }
+}
+
 async function doExportSelectedGroups() {
   setState('capturing');
   resultEl.textContent = 'Starting selected-groups export...';
@@ -518,6 +535,7 @@ document.getElementById('requestPerm')?.addEventListener('click', async () => {
 
 document.getElementById('scanStandalone')?.addEventListener('click', doScanStandalone);
 document.getElementById('scanProject')?.addEventListener('click', doScanProject);
+document.getElementById('scanAllProjects')?.addEventListener('click', doScanAllProjects);
 document.getElementById('exportSelectedGroups')?.addEventListener('click', doExportSelectedGroups);
 document.getElementById('exportSelectedChats')?.addEventListener('click', doExportSelectedChats);
 document.getElementById('recaptureSelectedChats')?.addEventListener('click', doRecaptureSelectedChats);

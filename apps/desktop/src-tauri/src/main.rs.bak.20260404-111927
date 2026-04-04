@@ -267,14 +267,6 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn namespace_scoped_id(chat_id: &str, local_id: &str) -> String {
-    if local_id.contains("::") {
-        local_id.to_string()
-    } else {
-        format!("{}::{}", chat_id, local_id)
-    }
-}
-
 fn capture_bundle_needs_reimport(
     conn: &Connection,
     bundle: &CaptureBundle,
@@ -326,6 +318,71 @@ fn capture_bundle_needs_reimport(
     }
 
     Ok(false)
+}
+
+fn persist_capture_bundle(conn: &mut Connection, bundle: CaptureBundle) -> Result<(), String> {
+    let workspace_id = bundle.workspace.id.clone();
+    let workspace_name = bundle
+        .workspace
+        .name
+        .clone()
+        .unwrap_or("Default Workspace".to_string());
+
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO workspaces (id, name) VALUES (?1, ?2)",
+        params![workspace_id, workspace_name],
+    )
+    .map_err(|e| e.to_string())?;
+
+    for project in bundle.projects {
+        tx.execute(
+            "INSERT OR REPLACE INTO projects (id, workspace_id, name) VALUES (?1, ?2, ?3)",
+            params![project.id, workspace_id, project.name],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    for chat in bundle.chats {
+        tx.execute(
+            "INSERT OR REPLACE INTO chats (id, workspace_id, project_id, title, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![chat.id, workspace_id, chat.project_id, chat.title, chat.fingerprint, chat.updated_at],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let mut message_index_by_chat: HashMap<String, i64> = HashMap::new();
+    for message in bundle.messages {
+        let sort_index = message_index_by_chat
+            .entry(message.chat_id.clone())
+            .or_insert(0);
+
+        tx.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, role, body, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, CURRENT_TIMESTAMP))",
+            params![
+                message.id,
+                message.chat_id,
+                message.role,
+                message.raw_html.unwrap_or_default(),
+                *sort_index,
+                message.created_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+
+        *sort_index += 1;
+    }
+
+    for asset in bundle.assets {
+        tx.execute(
+            "INSERT OR REPLACE INTO assets (id, chat_id) VALUES (?1, ?2)",
+            params![asset.id, asset.chat_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().map_err(|e| e.to_string())
 }
 
 fn sanitize_for_fs(input: &str) -> String {
@@ -688,7 +745,7 @@ fn persist_capture_bundle(conn: &mut Connection, bundle: CaptureBundle) -> Resul
 
         tx.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, role, body, html_body, blocks_json, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, CURRENT_TIMESTAMP))",
-            params![namespace_scoped_id(&message.chat_id, &message.id), message.chat_id, message.role, body, html_body, blocks_json, *sort_index, message.created_at],
+            params![message.id, message.chat_id, message.role, body, html_body, blocks_json, *sort_index, message.created_at],
         )
         .map_err(|e| e.to_string())?;
         *sort_index += 1;
@@ -697,10 +754,7 @@ fn persist_capture_bundle(conn: &mut Connection, bundle: CaptureBundle) -> Resul
     for asset in bundle.assets {
         tx.execute(
             "INSERT OR REPLACE INTO assets (id, chat_id) VALUES (?1, ?2)",
-            params![
-                namespace_scoped_id(&asset.chat_id, &asset.id),
-                asset.chat_id
-            ],
+            params![asset.id, asset.chat_id],
         )
         .map_err(|e| e.to_string())?;
     }

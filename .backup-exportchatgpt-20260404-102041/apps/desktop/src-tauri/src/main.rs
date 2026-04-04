@@ -2,7 +2,6 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -65,22 +64,11 @@ struct ArchiveTree {
     standalone: Vec<ArchiveChatNode>,
 }
 
-fn default_workspace() -> Workspace {
-    Workspace {
-        id: "default".to_string(),
-        name: Some("Default Workspace".to_string()),
-    }
-}
-
 #[derive(Deserialize)]
 struct CaptureBundle {
-    #[serde(default = "default_workspace")]
     workspace: Workspace,
-    #[serde(default)]
     projects: Vec<Project>,
-    #[serde(default)]
     chats: Vec<Chat>,
-    #[serde(default)]
     messages: Vec<Message>,
     #[serde(default)]
     assets: Vec<Asset>,
@@ -101,33 +89,30 @@ struct Project {
 #[derive(Deserialize)]
 struct Chat {
     id: String,
-    #[serde(rename = "projectId", alias = "project_id")]
+    #[serde(rename = "projectId")]
     project_id: Option<String>,
     title: String,
-    #[serde(default)]
     fingerprint: Option<String>,
-    #[serde(rename = "updatedAt", alias = "updated_at", default)]
+    #[serde(rename = "updatedAt")]
     updated_at: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Message {
     id: String,
-    #[serde(rename = "chatId", alias = "chat_id")]
+    #[serde(rename = "chatId")]
     chat_id: String,
     role: String,
-    #[serde(rename = "rawHtml", alias = "raw_html", default)]
+    #[serde(rename = "rawHtml")]
     raw_html: Option<String>,
-    #[serde(default)]
-    blocks: Vec<Value>,
-    #[serde(rename = "createdAt", alias = "created_at", default)]
+    #[serde(rename = "createdAt")]
     created_at: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Asset {
     id: String,
-    #[serde(rename = "chatId", alias = "chat_id")]
+    #[serde(rename = "chatId")]
     chat_id: String,
 }
 
@@ -136,15 +121,6 @@ struct OfficialConversation {
     id: Option<String>,
     title: Option<String>,
     update_time: Option<f64>,
-}
-
-#[derive(Serialize)]
-struct ExportMessage {
-    id: String,
-    role: String,
-    body: String,
-    html: String,
-    blocks: Value,
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -177,8 +153,6 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
           chat_id TEXT NOT NULL,
           role TEXT NOT NULL,
           body TEXT,
-          html_body TEXT,
-          blocks_json TEXT,
           sort_index INTEGER NOT NULL DEFAULT 0,
           created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -209,18 +183,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE messages ADD COLUMN sort_index INTEGER NOT NULL DEFAULT 0",
         [],
     );
-    let _ = conn.execute("ALTER TABLE messages ADD COLUMN html_body TEXT", []);
-    let _ = conn.execute("ALTER TABLE messages ADD COLUMN blocks_json TEXT", []);
-
-    let _ = conn.execute(
-        "UPDATE messages SET html_body = body WHERE html_body IS NULL AND body IS NOT NULL AND TRIM(body) LIKE '<%'",
-        [],
-    );
 
     let _ = conn.execute_batch(
         "
         WITH ordered AS (
-          SELECT rowid, ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY sort_index, rowid) - 1 AS rn
+          SELECT rowid, ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY rowid) - 1 AS rn
           FROM messages
         )
         UPDATE messages
@@ -243,14 +210,12 @@ fn ensure_default_workspace(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn chat_fingerprint(conn: &Connection, chat_id: &str) -> rusqlite::Result<String> {
-    let mut stmt = conn.prepare(
-        "SELECT role, COALESCE(body, ''), COALESCE(html_body, '') FROM messages WHERE chat_id = ?1 ORDER BY sort_index, id",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT role, body FROM messages WHERE chat_id = ?1 ORDER BY sort_index, id")?;
     let rows = stmt.query_map(params![chat_id], |row| {
         let role: String = row.get(0)?;
         let body: String = row.get(1)?;
-        let html_body: String = row.get(2)?;
-        Ok(format!("{}:{}:{}", role, body, html_body))
+        Ok(format!("{}:{}", role, body))
     })?;
 
     let mut hasher = Sha256::new();
@@ -265,67 +230,6 @@ fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
-}
-
-fn namespace_scoped_id(chat_id: &str, local_id: &str) -> String {
-    if local_id.contains("::") {
-        local_id.to_string()
-    } else {
-        format!("{}::{}", chat_id, local_id)
-    }
-}
-
-fn capture_bundle_needs_reimport(
-    conn: &Connection,
-    bundle: &CaptureBundle,
-) -> Result<bool, String> {
-    for chat in &bundle.chats {
-        let chat_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM chats WHERE id = ?1",
-                params![chat.id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if chat_exists == 0 {
-            return Ok(true);
-        }
-
-        let stored_messages: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE chat_id = ?1",
-                params![chat.id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        let stored_assets: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE chat_id = ?1",
-                params![chat.id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        let expected_messages = bundle
-            .messages
-            .iter()
-            .filter(|message| message.chat_id == chat.id)
-            .count() as i64;
-
-        let expected_assets = bundle
-            .assets
-            .iter()
-            .filter(|asset| asset.chat_id == chat.id)
-            .count() as i64;
-
-        if expected_messages > stored_messages || expected_assets > stored_assets {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 fn sanitize_for_fs(input: &str) -> String {
@@ -345,368 +249,6 @@ fn escape_html(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
-}
-
-fn strip_tags(input: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    let mut tag_buf = String::new();
-
-    for ch in input.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
-                tag_buf.clear();
-            }
-            '>' if in_tag => {
-                let tag = tag_buf.trim().to_lowercase();
-                if tag.starts_with("br")
-                    || tag.starts_with("/p")
-                    || tag.starts_with("/div")
-                    || tag.starts_with("/li")
-                    || tag.starts_with("/tr")
-                    || tag.starts_with("/h")
-                    || tag.starts_with("/blockquote")
-                    || tag == "p"
-                    || tag == "div"
-                    || tag == "li"
-                    || tag == "tr"
-                {
-                    if !out.ends_with('\n') {
-                        out.push('\n');
-                    }
-                }
-                in_tag = false;
-            }
-            _ if in_tag => tag_buf.push(ch),
-            _ => out.push(ch),
-        }
-    }
-
-    out.split('\n')
-        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .trim()
-        .to_string()
-}
-
-fn value_as_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Bool(v) => v.to_string(),
-        Value::Number(v) => v.to_string(),
-        Value::String(v) => v.clone(),
-        Value::Array(items) => items
-            .iter()
-            .map(value_as_text)
-            .filter(|s| !s.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(Value::as_str) {
-                return text.to_string();
-            }
-            if let Some(code) = map.get("code").and_then(Value::as_str) {
-                return code.to_string();
-            }
-            if let Some(html) = map.get("html").and_then(Value::as_str) {
-                return strip_tags(html);
-            }
-            if let Some(items) = map.get("items").and_then(Value::as_array) {
-                return items
-                    .iter()
-                    .map(value_as_text)
-                    .filter(|s| !s.trim().is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-            map.values()
-                .map(value_as_text)
-                .filter(|s| !s.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-    }
-}
-
-fn blocks_to_plain_text(blocks: &[Value]) -> String {
-    blocks
-        .iter()
-        .map(value_as_text)
-        .filter(|s| !s.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-        .trim()
-        .to_string()
-}
-
-fn array_of_strings(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| items.iter().map(value_as_text).collect::<Vec<_>>())
-        .unwrap_or_default()
-}
-
-fn render_block_html(block: &Value) -> String {
-    let Some(obj) = block.as_object() else {
-        let text = value_as_text(block);
-        return if text.trim().is_empty() {
-            String::new()
-        } else {
-            format!("<p>{}</p>", escape_html(&text))
-        };
-    };
-
-    let kind = obj
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("paragraph")
-        .to_lowercase();
-
-    match kind.as_str() {
-        "unknown_html" => obj
-            .get("html")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        "html" => obj
-            .get("html")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        "paragraph" => {
-            let text = obj
-                .get("text")
-                .map(value_as_text)
-                .unwrap_or_else(|| value_as_text(block));
-            if text.trim().is_empty() {
-                String::new()
-            } else {
-                format!("<p>{}</p>", escape_html(&text))
-            }
-        }
-        "heading" => {
-            let text = obj
-                .get("text")
-                .map(value_as_text)
-                .unwrap_or_else(|| value_as_text(block));
-            let level = obj
-                .get("level")
-                .and_then(Value::as_u64)
-                .map(|v| v.clamp(1, 6))
-                .unwrap_or(3);
-            format!("<h{0}>{1}</h{0}>", level, escape_html(&text))
-        }
-        "quote" | "blockquote" => {
-            let text = obj
-                .get("text")
-                .map(value_as_text)
-                .unwrap_or_else(|| value_as_text(block));
-            format!("<blockquote>{}</blockquote>", escape_html(&text))
-        }
-        "code" | "code_block" => {
-            let code = obj
-                .get("code")
-                .map(value_as_text)
-                .or_else(|| obj.get("text").map(value_as_text))
-                .unwrap_or_default();
-            let language = obj
-                .get("language")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            format!(
-                "<pre><code class=\"language-{}\">{}</code></pre>",
-                escape_html(language),
-                escape_html(&code)
-            )
-        }
-        "list" => {
-            let ordered = obj.get("ordered").and_then(Value::as_bool).unwrap_or(false);
-            let tag = if ordered { "ol" } else { "ul" };
-            let items = array_of_strings(obj.get("items"))
-                .into_iter()
-                .map(|item| format!("<li>{}</li>", escape_html(&item)))
-                .collect::<Vec<_>>()
-                .join("");
-            format!("<{tag}>{items}</{tag}>")
-        }
-        "table" => {
-            let headers = array_of_strings(obj.get("headers"));
-            let rows = obj
-                .get("rows")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-
-            let thead = if headers.is_empty() {
-                String::new()
-            } else {
-                let ths = headers
-                    .iter()
-                    .map(|h| format!("<th>{}</th>", escape_html(h)))
-                    .collect::<Vec<_>>()
-                    .join("");
-                format!("<thead><tr>{}</tr></thead>", ths)
-            };
-
-            let tbody = rows
-                .iter()
-                .map(|row| {
-                    let cells = row
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(value_as_text)
-                        .map(|cell| format!("<td>{}</td>", escape_html(&cell)))
-                        .collect::<Vec<_>>()
-                        .join("");
-                    format!("<tr>{}</tr>", cells)
-                })
-                .collect::<Vec<_>>()
-                .join("");
-
-            format!("<table>{}<tbody>{}</tbody></table>", thead, tbody)
-        }
-        _ => {
-            let text = obj
-                .get("text")
-                .map(value_as_text)
-                .unwrap_or_else(|| value_as_text(block));
-            if text.trim().is_empty() {
-                String::new()
-            } else {
-                format!("<p>{}</p>", escape_html(&text))
-            }
-        }
-    }
-}
-
-fn blocks_to_html(blocks: &[Value]) -> String {
-    blocks
-        .iter()
-        .map(render_block_html)
-        .filter(|s| !s.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn message_html_from_parts(
-    body: &str,
-    html_body: Option<&str>,
-    blocks_json: Option<&str>,
-) -> String {
-    if let Some(html) = html_body {
-        if !html.trim().is_empty() {
-            return html.to_string();
-        }
-    }
-
-    if let Some(blocks_json) = blocks_json {
-        if let Ok(blocks) = serde_json::from_str::<Vec<Value>>(blocks_json) {
-            let rendered = blocks_to_html(&blocks);
-            if !rendered.trim().is_empty() {
-                return rendered;
-            }
-        }
-    }
-
-    if body.trim().is_empty() {
-        String::new()
-    } else {
-        format!("<p>{}</p>", escape_html(body).replace('\n', "<br />"))
-    }
-}
-
-fn persist_capture_bundle(conn: &mut Connection, bundle: CaptureBundle) -> Result<usize, String> {
-    init_schema(conn).map_err(|e| e.to_string())?;
-
-    let workspace_id = if bundle.workspace.id.trim().is_empty() {
-        "default".to_string()
-    } else {
-        bundle.workspace.id.clone()
-    };
-    let workspace_name = bundle
-        .workspace
-        .name
-        .clone()
-        .unwrap_or_else(|| "Default Workspace".to_string());
-
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-
-    tx.execute(
-        "INSERT OR REPLACE INTO workspaces (id, name) VALUES (?1, ?2)",
-        params![workspace_id, workspace_name],
-    )
-    .map_err(|e| e.to_string())?;
-
-    for project in bundle.projects {
-        tx.execute(
-            "INSERT OR REPLACE INTO projects (id, workspace_id, name) VALUES (?1, ?2, ?3)",
-            params![project.id, workspace_id, project.name],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    for chat in bundle.chats {
-        tx.execute(
-            "INSERT OR REPLACE INTO chats (id, workspace_id, project_id, title, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![chat.id, workspace_id, chat.project_id, chat.title, chat.fingerprint, chat.updated_at],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    let mut message_index_by_chat: HashMap<String, i64> = HashMap::new();
-    for message in bundle.messages {
-        let sort_index = message_index_by_chat
-            .entry(message.chat_id.clone())
-            .or_insert(0);
-        let html_body = message
-            .raw_html
-            .clone()
-            .filter(|value| !value.trim().is_empty());
-
-        let blocks_json = if message.blocks.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&message.blocks).map_err(|e| e.to_string())?)
-        };
-
-        let mut body = blocks_to_plain_text(&message.blocks);
-        if body.trim().is_empty() {
-            if let Some(html) = &html_body {
-                body = strip_tags(html);
-            }
-        }
-
-        tx.execute(
-            "INSERT OR REPLACE INTO messages (id, chat_id, role, body, html_body, blocks_json, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, CURRENT_TIMESTAMP))",
-            params![namespace_scoped_id(&message.chat_id, &message.id), message.chat_id, message.role, body, html_body, blocks_json, *sort_index, message.created_at],
-        )
-        .map_err(|e| e.to_string())?;
-        *sort_index += 1;
-    }
-
-    for asset in bundle.assets {
-        tx.execute(
-            "INSERT OR REPLACE INTO assets (id, chat_id) VALUES (?1, ?2)",
-            params![
-                namespace_scoped_id(&asset.chat_id, &asset.id),
-                asset.chat_id
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(message_index_by_chat.len())
 }
 
 #[tauri::command]
@@ -1008,11 +550,6 @@ fn delete_archive_items(
 
     tx.commit().map_err(|e| e.to_string())?;
 
-    if !all_chat_ids.is_empty() || !project_ids.is_empty() {
-        conn.execute("DELETE FROM imported_capture_files", [])
-            .map_err(|e| e.to_string())?;
-    }
-
     if !root_dir.trim().is_empty() {
         for (chat_id, title, project_name) in &export_entries {
             let _ = remove_chat_export(&root_dir, chat_id, title, project_name.as_deref());
@@ -1021,7 +558,7 @@ fn delete_archive_items(
     }
 
     Ok(format!(
-        "Removed {} chat(s), {} project(s), and cleared import history so auto-import can rehydrate deleted items",
+        "Removed {} chat(s) and {} project(s)",
         all_chat_ids.len(),
         project_ids.len()
     ))
@@ -1048,7 +585,57 @@ fn import_capture_bundle(
         .map_err(|_| "db lock failed".to_string())?;
     init_schema(&conn).map_err(|e| e.to_string())?;
 
-    persist_capture_bundle(&mut conn, bundle)?;
+    let workspace_id = bundle.workspace.id.clone();
+    let workspace_name = bundle
+        .workspace
+        .name
+        .clone()
+        .unwrap_or("Default Workspace".to_string());
+
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO workspaces (id, name) VALUES (?1, ?2)",
+        params![workspace_id, workspace_name],
+    )
+    .map_err(|e| e.to_string())?;
+
+    for p in bundle.projects {
+        tx.execute(
+            "INSERT OR REPLACE INTO projects (id, workspace_id, name) VALUES (?1, ?2, ?3)",
+            params![p.id, workspace_id, p.name],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    for c in bundle.chats {
+        tx.execute(
+            "INSERT OR REPLACE INTO chats (id, workspace_id, project_id, title, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![c.id, workspace_id, c.project_id, c.title, c.fingerprint, c.updated_at],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let mut message_index_by_chat: HashMap<String, i64> = HashMap::new();
+    for m in bundle.messages {
+        let sort_index = message_index_by_chat.entry(m.chat_id.clone()).or_insert(0);
+        tx.execute(
+            "INSERT OR REPLACE INTO messages (id, chat_id, role, body, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, CURRENT_TIMESTAMP))",
+            params![m.id, m.chat_id, m.role, m.raw_html.unwrap_or_default(), *sort_index, m.created_at],
+        )
+        .map_err(|e| e.to_string())?;
+        *sort_index += 1;
+    }
+
+    for a in bundle.assets {
+        tx.execute(
+            "INSERT OR REPLACE INTO assets (id, chat_id) VALUES (?1, ?2)",
+            params![a.id, a.chat_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().map_err(|e| e.to_string())?;
     Ok("Capture bundle imported successfully".to_string())
 }
 
@@ -1090,17 +677,17 @@ fn import_official_export_zip(
 
     let imported_count = parsed.len();
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    for conversation in parsed {
-        let id = conversation.id.unwrap_or(format!("official-{}", rand_id()));
+    for c in parsed {
+        let id = c.id.unwrap_or(format!("official-{}", rand_id()));
         tx.execute(
             "INSERT OR REPLACE INTO chats (id, workspace_id, project_id, title, updated_at) VALUES (?1, 'default', 'imported', ?2, ?3)",
-            params![id, conversation.title.unwrap_or("Untitled Chat".to_string()), conversation.update_time.map(|v| v.to_string())],
+            params![id, c.title.unwrap_or("Untitled Chat".to_string()), c.update_time.map(|v| v.to_string())],
         )
         .map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(format!(
-        "Imported {} official conversations (titles only)",
+        "Imported {} official conversations",
         imported_count
     ))
 }
@@ -1123,62 +710,23 @@ fn write_chat_export(
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let mut stmt = conn
-        .prepare(
-            "SELECT id, role, COALESCE(body, ''), COALESCE(html_body, ''), COALESCE(blocks_json, '[]') FROM messages WHERE chat_id = ?1 ORDER BY sort_index, id",
-        )
+        .prepare("SELECT id, role, body FROM messages WHERE chat_id = ?1 ORDER BY sort_index, id")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![chat_id], |row| {
             let id: String = row.get(0)?;
             let role: String = row.get(1)?;
             let body: String = row.get(2)?;
-            let html_body: String = row.get(3)?;
-            let blocks_json: String = row.get(4)?;
-            Ok((id, role, body, html_body, blocks_json))
+            Ok((id, role, body))
         })
         .map_err(|e| e.to_string())?;
 
     let mut md = String::new();
-    let mut json_lines: Vec<ExportMessage> = Vec::new();
-    let mut html_messages = String::new();
-
+    let mut json_lines: Vec<serde_json::Value> = Vec::new();
     for row in rows {
-        let (id, role, body, html_body, blocks_json) = row.map_err(|e| e.to_string())?;
-        let html = message_html_from_parts(&body, Some(&html_body), Some(&blocks_json));
-        let blocks_value =
-            serde_json::from_str::<Value>(&blocks_json).unwrap_or(Value::Array(vec![]));
-
-        if !body.trim().is_empty() {
-            md.push_str(&format!("### {}\n\n{}\n\n---\n\n", role, body));
-        }
-
-        json_lines.push(ExportMessage {
-            id: id.clone(),
-            role: role.clone(),
-            body: body.clone(),
-            html: html.clone(),
-            blocks: blocks_value,
-        });
-
-        let bubble_class = if role.eq_ignore_ascii_case("user") {
-            "bubble user"
-        } else {
-            "bubble assistant"
-        };
-
-        html_messages.push_str(&format!(
-            r#"<article class="message {role_class}">
-  <div class="{bubble_class}">
-    <div class="message-role">{role_label}</div>
-    <div class="message-body">{html}</div>
-  </div>
-</article>
-"#,
-            role_class = escape_html(&role.to_lowercase()),
-            bubble_class = bubble_class,
-            role_label = escape_html(&role),
-            html = html
-        ));
+        let (id, role, body) = row.map_err(|e| e.to_string())?;
+        md.push_str(&format!("### {}\n\n{}\n\n---\n\n", role, body));
+        json_lines.push(serde_json::json!({ "id": id, "role": role, "body": body }));
     }
 
     fs::write(dir.join("chat.md"), &md).map_err(|e| e.to_string())?;
@@ -1192,242 +740,10 @@ fn write_chat_export(
     .map_err(|e| e.to_string())?;
 
     let html = format!(
-        r#"<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>{title}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root {{
-      color-scheme: dark;
-      --bg: #212121;
-      --surface: #171717;
-      --surface-2: #2f2f2f;
-      --border: #3f3f46;
-      --text: #ececec;
-      --muted: #a1a1aa;
-      --assistant: #2a2a2a;
-      --user: #30343f;
-    }}
-    * {{ box-sizing: border-box; }}
-    html, body {{ margin: 0; background: var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-    body {{ min-height: 100vh; }}
-    .topbar {{
-      position: sticky;
-      top: 0;
-      z-index: 10;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 16px 20px;
-      border-bottom: 1px solid rgba(255,255,255,.06);
-      background: rgba(33,33,33,.94);
-      backdrop-filter: blur(10px);
-    }}
-    .title-wrap h1 {{
-      margin: 0;
-      font-size: 18px;
-      line-height: 1.3;
-    }}
-    .title-wrap .meta {{
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 13px;
-    }}
-    .actions {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
-    .actions button {{
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text);
-      padding: 10px 12px;
-      border-radius: 999px;
-      cursor: pointer;
-      font-size: 13px;
-    }}
-    .page {{
-      max-width: 920px;
-      margin: 0 auto;
-      padding: 24px 16px 56px;
-    }}
-    .message {{
-      display: flex;
-      margin: 0 0 18px;
-    }}
-    .bubble {{
-      width: 100%;
-      border: 1px solid rgba(255,255,255,.06);
-      border-radius: 18px;
-      padding: 14px 16px;
-      overflow: hidden;
-    }}
-    .bubble.assistant {{ background: var(--assistant); }}
-    .bubble.user {{ background: var(--user); }}
-    .message-role {{
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: .08em;
-      text-transform: uppercase;
-      margin-bottom: 10px;
-    }}
-    .message-body {{
-      line-height: 1.65;
-      font-size: 15px;
-    }}
-    .message-body > :first-child {{ margin-top: 0; }}
-    .message-body > :last-child {{ margin-bottom: 0; }}
-    .message-body p, .message-body ul, .message-body ol, .message-body blockquote, .message-body pre, .message-body table {{
-      margin: 0 0 14px;
-    }}
-    .message-body h1, .message-body h2, .message-body h3, .message-body h4, .message-body h5, .message-body h6 {{
-      margin: 18px 0 10px;
-      line-height: 1.3;
-    }}
-    .message-body a {{ color: #8ab4ff; }}
-    .message-body code {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: .92em;
-    }}
-    .code-wrap {{
-      position: relative;
-      margin: 0 0 14px;
-    }}
-    .code-copy {{
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      border: 1px solid var(--border);
-      background: #101010;
-      color: var(--text);
-      border-radius: 10px;
-      padding: 6px 10px;
-      font-size: 12px;
-      cursor: pointer;
-    }}
-    .message-body pre {{
-      background: #101010;
-      border: 1px solid rgba(255,255,255,.08);
-      border-radius: 14px;
-      padding: 16px;
-      overflow: auto;
-    }}
-    .message-body pre code {{
-      display: block;
-      white-space: pre;
-    }}
-    .message-body table {{
-      width: 100%;
-      border-collapse: collapse;
-      overflow: hidden;
-      border-radius: 14px;
-      border: 1px solid rgba(255,255,255,.08);
-      display: block;
-      overflow-x: auto;
-    }}
-    .message-body th, .message-body td {{
-      padding: 10px 12px;
-      border-bottom: 1px solid rgba(255,255,255,.08);
-      text-align: left;
-      vertical-align: top;
-      min-width: 120px;
-    }}
-    .message-body thead th {{
-      background: #181818;
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .06em;
-    }}
-    .message-body blockquote {{
-      border-left: 3px solid #5b5b5b;
-      padding-left: 12px;
-      color: #d4d4d8;
-      margin-left: 0;
-    }}
-    @media print {{
-      .topbar {{ display: none; }}
-      .page {{ max-width: none; padding: 0; }}
-      .bubble {{ border-color: #bbb; background: white !important; color: black; }}
-      body {{ background: white; color: black; }}
-      .message-role {{ color: #666; }}
-      .message-body a {{ color: #000; text-decoration: underline; }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="topbar">
-    <div class="title-wrap">
-      <h1>{title}</h1>
-      <div class="meta">{project_meta}</div>
-    </div>
-    <div class="actions">
-      <button type="button" id="shareWhatsapp">Share to WhatsApp</button>
-      <button type="button" id="savePdf">Save to PDF</button>
-      <button type="button" id="printChat">Print</button>
-    </div>
-  </div>
-
-  <main class="page">
-    {messages}
-  </main>
-
-  <script>
-    function openWhatsAppShare() {{
-      const shareText = document.title + " " + window.location.href;
-      const url = "https://wa.me/?text=" + encodeURIComponent(shareText);
-      window.open(url, "_blank", "noopener");
-    }}
-
-    function printToPdf() {{
-      window.print();
-    }}
-
-    function addCopyButtons() {{
-      document.querySelectorAll(".message-body pre").forEach((pre) => {{
-        if (pre.parentElement && pre.parentElement.classList.contains("code-wrap")) return;
-        const wrapper = document.createElement("div");
-        wrapper.className = "code-wrap";
-        pre.parentNode.insertBefore(wrapper, pre);
-        wrapper.appendChild(pre);
-
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "code-copy";
-        button.textContent = "Copy";
-        button.addEventListener("click", async () => {{
-          const text = pre.innerText || "";
-          try {{
-            await navigator.clipboard.writeText(text);
-            const original = button.textContent;
-            button.textContent = "Copied";
-            setTimeout(() => button.textContent = original, 1200);
-          }} catch (_) {{
-            button.textContent = "Copy failed";
-            setTimeout(() => button.textContent = "Copy", 1200);
-          }}
-        }});
-        wrapper.appendChild(button);
-      }});
-    }}
-
-    document.getElementById("shareWhatsapp").addEventListener("click", openWhatsAppShare);
-    document.getElementById("savePdf").addEventListener("click", printToPdf);
-    document.getElementById("printChat").addEventListener("click", () => window.print());
-    addCopyButtons();
-  </script>
-</body>
-</html>"#,
-        title = escape_html(title),
-        project_meta = escape_html(project_name.as_deref().unwrap_or("Standalone chat export")),
-        messages = html_messages
+        "<html><body><h1>{}</h1><pre>{}</pre></body></html>",
+        escape_html(title),
+        escape_html(&md)
     );
-
     fs::write(dir.join("chat.html"), html).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1538,11 +854,7 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
     }
 
     * { box-sizing: border-box; }
-    html, body {
-      height: 100%;
-      margin: 0;
-      overflow: hidden;
-    }
+    html, body { height: 100%; margin: 0; }
     body {
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg);
@@ -1552,8 +864,7 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
     .app {
       display: grid;
       grid-template-columns: 300px 1fr;
-      height: 100vh;
-      overflow: hidden;
+      min-height: 100vh;
     }
 
     .sidebar {
@@ -1561,7 +872,6 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
       border-right: 1px solid var(--border);
       padding: 14px;
       overflow-y: auto;
-      overscroll-behavior: contain;
     }
 
     .sidebar h1 {
@@ -1580,8 +890,14 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
       margin-bottom: 14px;
     }
 
-    .nav-group { margin-bottom: 16px; }
-    .nav-group.hidden { display: none; }
+    .nav-group {
+      margin-bottom: 16px;
+    }
+
+    .nav-group.hidden {
+      display: none;
+    }
+
     .nav-group-title {
       color: var(--muted);
       font-size: 12px;
@@ -1605,12 +921,19 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
       transition: background .15s ease, border-color .15s ease;
     }
 
-    .nav-chat:hover { background: #2a2a2a; }
+    .nav-chat:hover {
+      background: #2a2a2a;
+    }
+
     .nav-chat.active {
       background: #2f2f2f;
       border-color: #4b5563;
     }
-    .nav-chat.hidden { display: none; }
+
+    .nav-chat.hidden {
+      display: none;
+    }
+
     .nav-chat-title {
       display: block;
       white-space: nowrap;
@@ -1622,11 +945,9 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
 
     .main {
       min-width: 0;
-      min-height: 0;
-      height: 100vh;
       display: flex;
       flex-direction: column;
-      overflow: hidden;
+      min-height: 100vh;
       background: var(--bg);
     }
 
@@ -1634,8 +955,10 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
       padding: 16px 24px 10px;
       border-bottom: 1px solid rgba(255,255,255,.05);
       background: rgba(33,33,33,.96);
+      position: sticky;
+      top: 0;
+      z-index: 5;
       backdrop-filter: blur(12px);
-      flex: 0 0 auto;
     }
 
     .title {
@@ -1651,22 +974,20 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
     }
 
     .viewer-wrap {
-      flex: 1 1 auto;
+      flex: 1;
       min-height: 0;
-      overflow: hidden;
+      padding: 0;
     }
 
     iframe {
       width: 100%;
-      height: 100%;
+      height: calc(100vh - 71px);
       border: 0;
       background: #212121;
-      display: block;
     }
 
     .empty {
-      width: 100%;
-      height: 100%;
+      height: calc(100vh - 71px);
       display: grid;
       place-items: center;
       color: var(--muted);
@@ -1675,10 +996,8 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
     }
 
     @media (max-width: 900px) {
-      html, body { overflow: auto; }
       .app {
         grid-template-columns: 1fr;
-        height: auto;
       }
 
       .sidebar {
@@ -1687,8 +1006,8 @@ fn build_archive_index_html(conn: &Connection, root: &str) -> Result<(), String>
         border-bottom: 1px solid var(--border);
       }
 
-      .main {
-        height: 70vh;
+      iframe, .empty {
+        height: 60vh;
       }
     }
   </style>
@@ -1860,7 +1179,7 @@ fn export_selected_archive(
 
         write_chat_export(&conn, &root_dir, cid, &title)?;
         conn.execute(
-            "UPDATE chats SET exported_fingerprint = ?1, fingerprint = COALESCE(fingerprint, ?1) WHERE id = ?2",
+            "UPDATE chats SET exported_fingerprint = ?1 WHERE id = ?2",
             params![live_fp, cid],
         )
         .map_err(|e| e.to_string())?;
@@ -1911,13 +1230,11 @@ fn list_json_files(folder_path: &str) -> Result<Vec<PathBuf>, String> {
 fn auto_import_capture_folder(
     state: tauri::State<AppState>,
     folder_path: String,
-    force_reimport: Option<bool>,
 ) -> Result<String, String> {
     if folder_path.trim().is_empty() {
         return Err("No watched folder configured".to_string());
     }
 
-    let force_reimport = force_reimport.unwrap_or(false);
     let files = list_json_files(&folder_path)?;
     let mut conn = state
         .conn
@@ -1927,7 +1244,6 @@ fn auto_import_capture_folder(
     ensure_default_workspace(&conn).map_err(|e| e.to_string())?;
 
     let mut imported = 0usize;
-    let mut reimported = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
 
@@ -1937,7 +1253,6 @@ fn auto_import_capture_folder(
             .unwrap_or(path.clone())
             .to_string_lossy()
             .to_string();
-
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(_) => {
@@ -1945,6 +1260,19 @@ fn auto_import_capture_folder(
                 continue;
             }
         };
+
+        let file_hash = hash_bytes(&bytes);
+
+        let already_seen_hash: Result<String, _> = conn.query_row(
+            "SELECT file_hash FROM imported_capture_files WHERE file_hash = ?1 LIMIT 1",
+            params![file_hash.clone()],
+            |row| row.get(0),
+        );
+
+        if already_seen_hash.is_ok() {
+            skipped += 1;
+            continue;
+        }
 
         let bundle: CaptureBundle = match serde_json::from_slice(&bytes) {
             Ok(bundle) => bundle,
@@ -1954,39 +1282,69 @@ fn auto_import_capture_folder(
             }
         };
 
-        let file_hash = hash_bytes(&bytes);
-        let already_seen_hash = conn.query_row(
-            "SELECT file_hash FROM imported_capture_files WHERE file_hash = ?1 LIMIT 1",
-            params![file_hash.clone()],
-            |row| row.get::<_, String>(0),
-        );
+        let workspace_id = bundle.workspace.id.clone();
+        let workspace_name = bundle
+            .workspace
+            .name
+            .clone()
+            .unwrap_or("Default Workspace".to_string());
 
-        let needs_reimport = capture_bundle_needs_reimport(&conn, &bundle)?;
-        let was_seen = already_seen_hash.is_ok();
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
 
-        if was_seen && !force_reimport && !needs_reimport {
-            skipped += 1;
-            continue;
+        tx.execute(
+            "INSERT OR REPLACE INTO workspaces (id, name) VALUES (?1, ?2)",
+            params![workspace_id, workspace_name],
+        )
+        .map_err(|e| e.to_string())?;
+
+        for p in bundle.projects {
+            tx.execute(
+                "INSERT OR REPLACE INTO projects (id, workspace_id, name) VALUES (?1, ?2, ?3)",
+                params![p.id, workspace_id, p.name],
+            )
+            .map_err(|e| e.to_string())?;
         }
 
-        persist_capture_bundle(&mut conn, bundle)?;
+        for c in bundle.chats {
+            tx.execute(
+                "INSERT OR REPLACE INTO chats (id, workspace_id, project_id, title, fingerprint, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![c.id, workspace_id, c.project_id, c.title, c.fingerprint, c.updated_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        let mut message_index_by_chat: HashMap<String, i64> = HashMap::new();
+        for m in bundle.messages {
+            let sort_index = message_index_by_chat.entry(m.chat_id.clone()).or_insert(0);
+            tx.execute(
+                "INSERT OR REPLACE INTO messages (id, chat_id, role, body, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, CURRENT_TIMESTAMP))",
+                params![m.id, m.chat_id, m.role, m.raw_html.unwrap_or_default(), *sort_index, m.created_at],
+            )
+            .map_err(|e| e.to_string())?;
+            *sort_index += 1;
+        }
+
+        for a in bundle.assets {
+            tx.execute(
+                "INSERT OR REPLACE INTO assets (id, chat_id) VALUES (?1, ?2)",
+                params![a.id, a.chat_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        tx.commit().map_err(|e| e.to_string())?;
 
         conn.execute(
             "INSERT OR REPLACE INTO imported_capture_files (path, file_hash) VALUES (?1, ?2)",
             params![canonical, file_hash],
         )
         .map_err(|e| e.to_string())?;
-
-        if was_seen || needs_reimport {
-            reimported += 1;
-        } else {
-            imported += 1;
-        }
+        imported += 1;
     }
 
     Ok(format!(
-        "Imported {} new file(s), reimported {}, skipped {}, failed {} from {}",
-        imported, reimported, skipped, failed, folder_path
+        "Imported {} new file(s), skipped {}, failed {} from {}",
+        imported, skipped, failed, folder_path
     ))
 }
 
@@ -2069,7 +1427,7 @@ fn run_pending_export_jobs(state: tauri::State<AppState>) -> Result<String, Stri
             }
 
             conn.execute(
-                "UPDATE chats SET exported_fingerprint = ?1, fingerprint = COALESCE(fingerprint, ?1) WHERE id = ?2",
+                "UPDATE chats SET exported_fingerprint = ?1 WHERE id = ?2",
                 params![live_fp, chat_id],
             )
             .map_err(|e| e.to_string())?;

@@ -267,14 +267,6 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn namespace_scoped_id(chat_id: &str, local_id: &str) -> String {
-    if local_id.contains("::") {
-        local_id.to_string()
-    } else {
-        format!("{}::{}", chat_id, local_id)
-    }
-}
-
 fn capture_bundle_needs_reimport(
     conn: &Connection,
     bundle: &CaptureBundle,
@@ -688,7 +680,7 @@ fn persist_capture_bundle(conn: &mut Connection, bundle: CaptureBundle) -> Resul
 
         tx.execute(
             "INSERT OR REPLACE INTO messages (id, chat_id, role, body, html_body, blocks_json, sort_index, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, CURRENT_TIMESTAMP))",
-            params![namespace_scoped_id(&message.chat_id, &message.id), message.chat_id, message.role, body, html_body, blocks_json, *sort_index, message.created_at],
+            params![message.id, message.chat_id, message.role, body, html_body, blocks_json, *sort_index, message.created_at],
         )
         .map_err(|e| e.to_string())?;
         *sort_index += 1;
@@ -697,10 +689,7 @@ fn persist_capture_bundle(conn: &mut Connection, bundle: CaptureBundle) -> Resul
     for asset in bundle.assets {
         tx.execute(
             "INSERT OR REPLACE INTO assets (id, chat_id) VALUES (?1, ?2)",
-            params![
-                namespace_scoped_id(&asset.chat_id, &asset.id),
-                asset.chat_id
-            ],
+            params![asset.id, asset.chat_id],
         )
         .map_err(|e| e.to_string())?;
     }
