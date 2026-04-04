@@ -1,0 +1,486 @@
+use super::*;
+
+pub(crate) fn render_chat_page(
+    title: &str,
+    project_label: &str,
+    rendered_messages: &str,
+) -> String {
+    let template = r##"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>__TITLE_ESC__</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #212121;
+      --panel: #171717;
+      --panel-2: #262626;
+      --border: #3f3f46;
+      --text: #ececec;
+      --muted: #a1a1aa;
+      --assistant: #171717;
+      --user: #2a2a2a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+    body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-x: hidden; }
+    .page { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .hero { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding-bottom: 18px; border-bottom: 1px solid rgba(255,255,255,.06); margin-bottom: 24px; }
+    .hero-text h1 { margin: 0 0 6px; font-size: 28px; line-height: 1.15; }
+    .hero-text .sub { color: var(--muted); font-size: 14px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .actions button { border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 999px; padding: 10px 14px; cursor: pointer; }
+    .messages { display: flex; flex-direction: column; gap: 18px; }
+    .message { border: 1px solid rgba(255,255,255,.05); border-radius: 18px; overflow: hidden; }
+    .message.assistant { background: var(--assistant); }
+    .message.user { background: var(--user); }
+    .message-meta { padding: 12px 16px 0; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+    .message-body { padding: 16px; min-width: 0; }
+    .message-body > :first-child { margin-top: 0; }
+    .message-body > :last-child { margin-bottom: 0; }
+    .message-body img, .message-body video, .message-body canvas, .message-body svg { max-width: 100% !important; height: auto !important; display: block; }
+    .message-body iframe { max-width: 100% !important; }
+    .message-body table { display: block; width: 100%; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+    .message-body th, .message-body td { border: 1px solid rgba(255,255,255,.14); padding: 8px 10px; vertical-align: top; }
+    .message-body pre { position: relative; max-width: 100%; overflow: auto; background: #111827; border-radius: 14px; padding: 14px; }
+    .message-body code { white-space: pre-wrap; word-break: break-word; }
+    .copy-code-btn { position: absolute; right: 10px; top: 10px; border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.06); color: var(--text); border-radius: 10px; padding: 6px 9px; cursor: pointer; font-size: 12px; }
+    .message-body a { color: #8ab4ff; word-break: break-word; }
+    .message-body ul, .message-body ol { padding-left: 1.35rem; }
+    .message-body blockquote { margin: 1rem 0; padding: .25rem 1rem; border-left: 3px solid #52525b; color: #d4d4d8; }
+    @media (max-width: 900px) {
+      .page { padding: 14px; }
+      .hero { align-items: flex-start; flex-direction: column; }
+      .hero-text h1 { font-size: 22px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="hero-text">
+        <h1>__TITLE_ESC__</h1>
+        <div class="sub">__PROJECT_ESC__</div>
+      </div>
+      <div class="actions">
+        <button id="shareWhatsApp" type="button">Share to WhatsApp</button>
+        <button id="savePdf" type="button">Save to PDF</button>
+        <button id="printPage" type="button">Print</button>
+      </div>
+    </header>
+
+    <main class="messages">__RENDERED_MESSAGES__</main>
+  </div>
+
+  <script>
+    const shareText = `${document.title}\n${location.href}`;
+    document.getElementById('shareWhatsApp')?.addEventListener('click', () => {
+      const url = 'https://wa.me/?text=' + encodeURIComponent(shareText);
+      window.open(url, '_blank', 'noopener,noreferrer');
+    });
+    document.getElementById('savePdf')?.addEventListener('click', () => window.print());
+    document.getElementById('printPage')?.addEventListener('click', () => window.print());
+
+    document.querySelectorAll('pre').forEach((pre) => {
+      if (pre.dataset.copyReady === '1') return;
+      pre.dataset.copyReady = '1';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'copy-code-btn';
+      btn.textContent = 'Copy';
+      btn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(pre.innerText);
+          const prev = btn.textContent;
+          btn.textContent = 'Copied';
+          setTimeout(() => btn.textContent = prev, 1200);
+        } catch (_err) {}
+      });
+      pre.appendChild(btn);
+    });
+  </script>
+</body>
+</html>"##;
+
+    let mut html = template.replace("__TITLE_ESC__", &escape_html(title));
+    html = html.replace("__PROJECT_ESC__", &escape_html(project_label));
+    html = html.replace("__RENDERED_MESSAGES__", rendered_messages);
+    html
+}
+
+pub(crate) fn render_archive_index(project_sections: &str, standalone_section: &str) -> String {
+    let template = r##"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Project Archivist Export</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #212121;
+      --panel: #171717;
+      --border: #3f3f46;
+      --text: #ececec;
+      --muted: #a1a1aa;
+      --sidebar-w: 310px;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; overflow: hidden; }
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .app {
+      display: grid;
+      grid-template-columns: var(--sidebar-w) 1fr;
+      height: 100vh;
+      min-height: 100vh;
+    }
+    body.sidebar-collapsed .app {
+      grid-template-columns: 0 1fr;
+    }
+    .sidebar {
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 14px;
+      transition: transform .18s ease, opacity .18s ease;
+    }
+    body.sidebar-collapsed .sidebar {
+      transform: translateX(-100%);
+      opacity: 0;
+      pointer-events: none;
+      padding: 0;
+      border-right: 0;
+    }
+    .sidebar h1 {
+      margin: 0 0 12px;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .search {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      margin-bottom: 10px;
+    }
+    .sidebar-controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .sidebar-btn, .topbar-btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: #242424;
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1;
+    }
+    .sidebar-btn:hover, .topbar-btn:hover {
+      border-color: #5b5b67;
+      background: #2a2a2a;
+    }
+    .nav-group {
+      margin-bottom: 12px;
+      border: 1px solid rgba(245, 158, 11, .75);
+      border-radius: 14px;
+      overflow: hidden;
+      background: #0f1b3b;
+    }
+    .nav-group.hidden { display: none; }
+    .nav-group-summary {
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: pointer;
+      padding: 10px 12px;
+      user-select: none;
+    }
+    .nav-group-summary::-webkit-details-marker { display: none; }
+    .nav-group-title {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .nav-group-count {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .nav-group-items {
+      padding: 0 8px 8px;
+    }
+    .nav-chat {
+      width: 100%;
+      text-align: left;
+      display: block;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      border: 1px solid transparent;
+      background: rgba(255,255,255,.04);
+      color: var(--text);
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background .15s ease, border-color .15s ease;
+    }
+    .nav-chat:hover { background: rgba(255,255,255,.08); }
+    .nav-chat.active {
+      background: rgba(255,255,255,.12);
+      border-color: #4b5563;
+    }
+    .nav-chat.hidden { display: none; }
+    .nav-chat-title {
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 14px;
+      line-height: 1.3;
+    }
+    .main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      min-height: 0;
+      background: var(--bg);
+    }
+    .topbar {
+      padding: 14px 20px 10px;
+      border-bottom: 1px solid rgba(255,255,255,.05);
+      background: rgba(33,33,33,.96);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      backdrop-filter: blur(12px);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .topbar-meta {
+      min-width: 0;
+      flex: 1;
+    }
+    .topbar-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .topbar-path {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .viewer-wrap {
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: var(--bg);
+      display: block;
+    }
+    .empty {
+      height: 100%;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      padding: 24px;
+      text-align: center;
+    }
+    @media (max-width: 900px) {
+      :root { --sidebar-w: 260px; }
+      .app { grid-template-columns: 1fr; }
+      .sidebar {
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: min(85vw, var(--sidebar-w));
+        z-index: 20;
+        box-shadow: 10px 0 30px rgba(0,0,0,.35);
+      }
+      body.sidebar-collapsed .sidebar {
+        transform: translateX(-110%);
+        opacity: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <h1>Project Archivist Export</h1>
+      <input id="sidebarSearch" class="search" placeholder="Search chats and content" />
+      <div class="sidebar-controls">
+        <button id="expandAllBtn" class="sidebar-btn" type="button">Expand all</button>
+        <button id="collapseAllBtn" class="sidebar-btn" type="button">Collapse all</button>
+      </div>
+      <div id="sidebarNav">
+        __PROJECT_SECTIONS__
+        __STANDALONE_SECTION__
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <button id="toggleSidebarBtn" class="topbar-btn" type="button">Sidebar</button>
+        <div class="topbar-meta">
+          <h2 class="topbar-title">Archive viewer</h2>
+          <div id="conversationPath" class="topbar-path">Select a chat from the sidebar.</div>
+        </div>
+      </div>
+
+      <div class="viewer-wrap">
+        <iframe id="viewer" src="about:blank"></iframe>
+        <div id="emptyState" class="empty">Select a chat from the sidebar to view it here.</div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const body = document.body;
+    const sidebarSearch = document.getElementById('sidebarSearch');
+    const navButtons = Array.from(document.querySelectorAll('.nav-chat'));
+    const navGroups = Array.from(document.querySelectorAll('.nav-group'));
+    const conversationPath = document.getElementById('conversationPath');
+    const viewer = document.getElementById('viewer');
+    const emptyState = document.getElementById('emptyState');
+    const toggleSidebarBtn = document.getElementById('toggleSidebarBtn');
+    const expandAllBtn = document.getElementById('expandAllBtn');
+    const collapseAllBtn = document.getElementById('collapseAllBtn');
+
+    function applyIframeFixes() {
+      let doc = null;
+      try {
+        doc = viewer.contentDocument || viewer.contentWindow?.document || null;
+      } catch (_err) {
+        return;
+      }
+      if (!doc || !doc.head) return;
+      if (doc.getElementById('pa-responsive-fixes')) return;
+
+      const style = doc.createElement('style');
+      style.id = 'pa-responsive-fixes';
+      style.textContent = `
+        html, body { max-width: 100%; overflow-x: hidden !important; }
+        img, svg, canvas, video, iframe, embed, object {
+          max-width: 100% !important;
+          height: auto !important;
+          object-fit: contain !important;
+        }
+        table {
+          display: block !important;
+          width: 100% !important;
+          max-width: 100% !important;
+          overflow-x: auto !important;
+          border-collapse: collapse;
+        }
+        pre {
+          max-width: 100% !important;
+          overflow-x: auto !important;
+          white-space: pre-wrap !important;
+          overflow-wrap: anywhere !important;
+        }
+        code {
+          white-space: pre-wrap !important;
+          overflow-wrap: anywhere !important;
+        }
+        a { overflow-wrap: anywhere; }
+      `;
+      doc.head.appendChild(style);
+    }
+
+    function loadConversation(button) {
+      const path = button.getAttribute('data-html');
+      if (!path) return;
+
+      navButtons.forEach((btn) => btn.classList.remove('active'));
+      button.classList.add('active');
+
+      conversationPath.textContent = path;
+      viewer.src = path;
+      viewer.style.display = 'block';
+      emptyState.style.display = 'none';
+
+      if (window.innerWidth <= 900) {
+        body.classList.add('sidebar-collapsed');
+      }
+    }
+
+    function updateSearch() {
+      const q = sidebarSearch.value.trim().toLowerCase();
+
+      navButtons.forEach((button) => {
+        const haystack = (
+          (button.getAttribute('data-title') || '') + ' ' +
+          (button.getAttribute('data-search') || '')
+        ).toLowerCase();
+        button.classList.toggle('hidden', !!q && !haystack.includes(q));
+      });
+
+      navGroups.forEach((group) => {
+        const visibleButtons = Array.from(group.querySelectorAll('.nav-chat')).some(
+          (button) => !button.classList.contains('hidden'),
+        );
+        group.classList.toggle('hidden', !visibleButtons);
+      });
+    }
+
+    toggleSidebarBtn.addEventListener('click', () => {
+      body.classList.toggle('sidebar-collapsed');
+    });
+
+    expandAllBtn.addEventListener('click', () => {
+      navGroups.forEach((group) => { group.open = true; });
+    });
+
+    collapseAllBtn.addEventListener('click', () => {
+      navGroups.forEach((group) => { group.open = false; });
+    });
+
+    sidebarSearch.addEventListener('input', updateSearch);
+
+    navButtons.forEach((button) => {
+      button.addEventListener('click', () => loadConversation(button));
+    });
+
+    viewer.addEventListener('load', () => {
+      applyIframeFixes();
+    });
+
+    if (navButtons.length) {
+      loadConversation(navButtons[0]);
+    } else {
+      viewer.style.display = 'none';
+      emptyState.style.display = 'grid';
+    }
+  </script>
+</body>
+</html>"##;
+
+    let mut html = template.replace("__PROJECT_SECTIONS__", project_sections);
+    html = html.replace("__STANDALONE_SECTION__", standalone_section);
+    html
+}
