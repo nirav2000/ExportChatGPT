@@ -8,9 +8,14 @@ const STORAGE_KEYS = {
   manualGroups: 'manualGroups',
   exportedChatIds: 'exportedChatIds',
   capturedChatMeta: 'capturedChatMeta',
-  cachedChatBundles: 'cachedChatBundles',
   groupUiState: 'groupUiState',
 };
+
+const LEGACY_STORAGE_KEYS = ['cachedChatBundles', 'lastCapture'];
+
+async function cleanupLegacyStorage() {
+  await chrome.storage.local.remove(LEGACY_STORAGE_KEYS);
+}
 
 async function sha256Hex(arrayBuffer) {
   const digest = await crypto.subtle.digest('SHA-256', arrayBuffer);
@@ -129,6 +134,7 @@ function sanitizeFilePart(input) {
 }
 
 async function getStoredState() {
+  await cleanupLegacyStorage();
   const data = await chrome.storage.local.get(Object.values(STORAGE_KEYS));
   return {
     ...data,
@@ -137,7 +143,6 @@ async function getStoredState() {
     manualGroups: data.manualGroups || {},
     exportedChatIds: data.exportedChatIds || [],
     capturedChatMeta: data.capturedChatMeta || {},
-    cachedChatBundles: data.cachedChatBundles || {},
     groupUiState: data.groupUiState || {},
   };
 }
@@ -326,11 +331,33 @@ async function captureWithRetry(tabId, chat, extraDelayMs = 9000) {
   return bundle;
 }
 
-function alreadyCaptured(chat, capturedChatMeta, cachedChatBundles) {
+function alreadyCaptured(chat, capturedChatMeta, exportedChatIds) {
   const meta = capturedChatMeta[chat.id];
   const hasMessages = typeof meta?.messageCount === 'number' && meta.messageCount > 0;
-  const hasBundle = Boolean(cachedChatBundles[chat.id]);
-  return hasMessages || hasBundle;
+  const isExported = exportedChatIds.includes(chat.id);
+  return hasMessages || isExported;
+}
+
+async function downloadJsonObject(obj, filename) {
+  const dataStr = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(obj, null, 2));
+  await chrome.downloads.download({
+    url: dataStr,
+    filename,
+    saveAs: false,
+  });
+}
+
+async function exportBundleForChat(bundle, chat) {
+  const folderRoot = chat.projectName
+    ? `projects/${sanitizeFilePart(chat.projectName)}`
+    : 'ungrouped';
+
+  const filename = `${sanitizeFilePart(chat.id)} - ${sanitizeFilePart(chat.title)}.json`;
+
+  await downloadJsonObject(
+    bundle,
+    `project-archivist-export/${folderRoot}/${filename}`,
+  );
 }
 
 async function runScopedScan(rawMessageType, phaseLabel) {
@@ -356,9 +383,9 @@ async function runScopedScan(rawMessageType, phaseLabel) {
         : [];
 
     const capturedChatMeta = { ...(stored.capturedChatMeta || {}) };
-    const cachedChatBundles = { ...(stored.cachedChatBundles || {}) };
+    const exportedChatIds = [...(stored.exportedChatIds || [])];
 
-    const chatsToCapture = scopedChats.filter((chat) => !alreadyCaptured(chat, capturedChatMeta, cachedChatBundles));
+    const chatsToCapture = scopedChats.filter((chat) => !alreadyCaptured(chat, capturedChatMeta, exportedChatIds));
 
     const progress = {
       phase: phaseLabel,
@@ -368,7 +395,7 @@ async function runScopedScan(rawMessageType, phaseLabel) {
       current: '',
       logs: [
         `Chats found in this scan: ${scopedChats.length}`,
-        `Already captured: ${scopedChats.length - chatsToCapture.length}`,
+        `Already captured/exported: ${scopedChats.length - chatsToCapture.length}`,
         `To capture now: ${chatsToCapture.length}`,
       ],
     };
@@ -396,7 +423,7 @@ async function runScopedScan(rawMessageType, phaseLabel) {
           .filter((c) => !stored.exportedChatIds.includes(c.id))
           .map((c) => c.id),
         [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
-        [STORAGE_KEYS.cachedChatBundles]: cachedChatBundles,
+        [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
       });
 
       return { ok: true, scan: combinedScan, skippedAlreadyScanned: true };
@@ -423,6 +450,8 @@ async function runScopedScan(rawMessageType, phaseLabel) {
           bundle = await captureWithRetry(tab.id, chat, 9000);
         }
 
+        await exportBundleForChat(bundle, chat);
+
         const messageCount = bundle.messages?.length || 0;
         const assetCount = bundle.assets?.length || 0;
 
@@ -432,7 +461,7 @@ async function runScopedScan(rawMessageType, phaseLabel) {
           capturedAt: new Date().toISOString(),
           changed: true,
         };
-        cachedChatBundles[chat.id] = bundle;
+        if (!exportedChatIds.includes(chat.id)) exportedChatIds.push(chat.id);
 
         progress.completed += 1;
         progress.logs.unshift(`✅ ${label} [${messageCount} msgs]`);
@@ -445,12 +474,12 @@ async function runScopedScan(rawMessageType, phaseLabel) {
       await chrome.storage.local.set({
         [STORAGE_KEYS.progress]: progress,
         [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
-        [STORAGE_KEYS.cachedChatBundles]: cachedChatBundles,
+        [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
       });
     }
 
     const selectedChatIds = scopedChats
-      .filter((c) => !stored.exportedChatIds.includes(c.id))
+      .filter((c) => !exportedChatIds.includes(c.id))
       .map((c) => c.id);
 
     await chrome.storage.local.set({
@@ -464,7 +493,7 @@ async function runScopedScan(rawMessageType, phaseLabel) {
       [STORAGE_KEYS.selectedProjectIds]: selectedProjectIds,
       [STORAGE_KEYS.selectedChatIds]: selectedChatIds,
       [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
-      [STORAGE_KEYS.cachedChatBundles]: cachedChatBundles,
+      [STORAGE_KEYS.exportedChatIds]: exportedChatIds,
     });
 
     return { ok: true, scan: combinedScan };
@@ -539,15 +568,6 @@ async function clearManualGroup(selectedChatIds) {
   return { ok: true };
 }
 
-async function downloadJsonObject(obj, filename) {
-  const dataStr = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(obj, null, 2));
-  await chrome.downloads.download({
-    url: dataStr,
-    filename,
-    saveAs: false,
-  });
-}
-
 async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false) {
   const stored = await getStoredState();
   const currentProjectScan = stored.currentProjectScan;
@@ -580,7 +600,6 @@ async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false
   const exportedChatIds = new Set(stored.exportedChatIds || []);
   const remainingSelected = new Set(stored.selectedChatIds || []);
   const capturedChatMeta = { ...(stored.capturedChatMeta || {}) };
-  const cachedChatBundles = { ...(stored.cachedChatBundles || {}) };
 
   for (let i = 0; i < chats.length; i++) {
     const chat = chats[i];
@@ -591,22 +610,18 @@ async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false
     await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
 
     try {
-      let bundle = cachedChatBundles[chat.id];
+      const sourceTab = await getActiveTab();
+      if (!sourceTab?.id) throw new Error('No active tab found');
+      await chrome.tabs.update(sourceTab.id, { url: chat.href });
+      await new Promise((r) => setTimeout(r, 4500));
+      await ensureContentScript(sourceTab.id);
 
-      if (recaptureOnly || !bundle) {
-        const sourceTab = await getActiveTab();
-        if (!sourceTab?.id) throw new Error('No active tab found');
-        await chrome.tabs.update(sourceTab.id, { url: chat.href });
-        await new Promise((r) => setTimeout(r, 4500));
-        await ensureContentScript(sourceTab.id);
-        bundle = await captureFromTab(sourceTab.id, chat);
-        if ((bundle.messages?.length || 0) === 0) {
-          progress.logs.unshift(`Retrying zero-message page with longer wait: ${label}`);
-          progress.logs = progress.logs.slice(0, 60);
-          await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
-          bundle = await captureWithRetry(sourceTab.id, chat, 9000);
-        }
-        cachedChatBundles[chat.id] = bundle;
+      let bundle = await captureFromTab(sourceTab.id, chat);
+      if ((bundle.messages?.length || 0) === 0) {
+        progress.logs.unshift(`Retrying zero-message page with longer wait: ${label}`);
+        progress.logs = progress.logs.slice(0, 60);
+        await chrome.storage.local.set({ [STORAGE_KEYS.progress]: progress });
+        bundle = await captureWithRetry(sourceTab.id, chat, 9000);
       }
 
       const messageCount = bundle.messages?.length || 0;
@@ -620,14 +635,7 @@ async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false
       };
 
       if (!recaptureOnly) {
-        const folderRoot = chat.projectName
-          ? `projects/${sanitizeFilePart(chat.projectName)}`
-          : 'ungrouped';
-
-        await downloadJsonObject(
-          bundle,
-          `project-archivist-export/${folderRoot}/${String(i + 1).padStart(3, '0')} - ${sanitizeFilePart(chat.title)}.json`,
-        );
+        await exportBundleForChat(bundle, chat);
         exportedChatIds.add(chat.id);
         remainingSelected.delete(chat.id);
       }
@@ -651,7 +659,6 @@ async function exportSelectedChats(selectedChatIds = null, recaptureOnly = false
       [STORAGE_KEYS.exportedChatIds]: Array.from(exportedChatIds),
       [STORAGE_KEYS.selectedChatIds]: Array.from(remainingSelected),
       [STORAGE_KEYS.capturedChatMeta]: capturedChatMeta,
-      [STORAGE_KEYS.cachedChatBundles]: cachedChatBundles,
     });
   }
 
@@ -768,3 +775,5 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   })();
   return true;
 });
+
+void cleanupLegacyStorage();
